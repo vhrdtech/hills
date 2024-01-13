@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use rkyv::{Archive, Deserialize, Serialize};
-use crate::SimpleVersion;
+use crate::record::SimpleVersion;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
