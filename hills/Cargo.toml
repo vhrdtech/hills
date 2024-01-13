@@ -9,3 +9,5 @@ rkyv = { version = "0.7.42", features = ["validation", "strict"] }
 chrono = { version = "0.4", features = ["rkyv"] }
 thiserror = "1.0"
 log = "0.4"
+
+hills-derive = { path = "../hills-derive" }

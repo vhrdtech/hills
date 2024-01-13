@@ -93,10 +93,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2bd12c1caf447e69cd4528f47f94d203fd2582878ecb9e9465484c4148a8223"
 
 [[package]]
-name = "cargo-hills"
-version = "0.1.0"
-
-[[package]]
 name = "cc"
 version = "1.0.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,10 +202,25 @@ name = "hills"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hills-derive",
  "log",
  "rkyv",
  "sled",
  "thiserror",
+]
+
+[[package]]
+name = "hills-base"
+version = "0.1.0"
+
+[[package]]
+name = "hills-derive"
+version = "0.1.0"
+dependencies = [
+ "hills-base",
+ "proc-macro-error",
+ "quote",
+ "syn 2.0.48",
 ]
 
 [[package]]
@@ -313,6 +324,30 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "winapi",
+]
+
+[[package]]
+name = "proc-macro-error"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
+dependencies = [
+ "proc-macro-error-attr",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+ "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "version_check",
 ]
 
 [[package]]
