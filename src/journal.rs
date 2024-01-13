@@ -1,8 +1,6 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use crate::record::RecordId;
 
-pub type Journal = Vec<JournalEntry>;
-
 #[derive(Archive, Serialize, Deserialize)]
 pub struct JournalEntry {
     serial: u64,
