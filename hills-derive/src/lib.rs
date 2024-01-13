@@ -14,6 +14,8 @@ pub fn reflect_fn(input: TokenStream) -> TokenStream {
     }
     // eprintln!("{:?}", input.attrs);
     let doc = collect_docs(&input.attrs);
+    let mut ts_non_std = quote!();
+
     let ts = match input.data {
         Data::Struct(ds) => {
             let mut ts = quote!(
@@ -44,28 +46,13 @@ pub fn reflect_fn(input: TokenStream) -> TokenStream {
                     fields
                 });
             ));
-            let struct_ident = input.ident;
-            let struct_ident_str = struct_ident.to_string();
 
-            let mut ts_non_std = quote!();
             for ty in non_std_types {
                 ts_non_std.append_all(quote!(
                     #ty::reflect(to);
                 ));
             }
-            quote!(
-                impl hills_base::Reflect for #struct_ident {
-                    fn reflect(to: &mut hills_base::TypeCollection) {
-                        let ty_name = format!("{}::{}", module_path!(), #struct_ident_str);
-                        if to.root.is_empty() {
-                            to.root = ty_name.clone();
-                        }
-                        #ts
-                        to.refs.insert(ty_name, self_reflect);
-                        #ts_non_std
-                    }
-                }
-            )
+            ts
         }
         Data::Enum(de) => {
             quote!()
@@ -73,9 +60,24 @@ pub fn reflect_fn(input: TokenStream) -> TokenStream {
         Data::Union(_) => {
             abort!(input.span(), "Unions are not supported");
         }
-    }.into();
+    };
     // eprintln!("{ts}");
-    ts
+
+    let struct_ident = input.ident;
+    let struct_ident_str = struct_ident.to_string();
+    quote!(
+        impl hills_base::Reflect for #struct_ident {
+            fn reflect(to: &mut hills_base::TypeCollection) {
+                let ty_name = format!("{}::{}", module_path!(), #struct_ident_str);
+                if to.root.is_empty() {
+                    to.root = ty_name.clone();
+                }
+                #ts
+                to.refs.insert(ty_name, self_reflect);
+                #ts_non_std
+            }
+        }
+    ).into()
 }
 
 fn collect_docs(attrs: &[Attribute]) -> String {
