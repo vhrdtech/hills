@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::Path;
 use log::trace;
 use rkyv::check_archived_root;
+use rkyv::ser::serializers::{AllocScratchError, CompositeSerializerError, SharedSerializeMapError};
 use sled::{Db, Tree};
 use thiserror::Error;
+use hills_base::{Reflect, TypeCollection};
 use crate::record::{RecordId, SimpleVersion};
 use crate::sync::NodeKind;
 use crate::tree::TreeDescriptor;
@@ -35,6 +38,15 @@ pub enum Error {
 
     #[error("check_archived_root failed")]
     RkyvCheckArchivedRoot,
+
+    #[error("rkyv serialize: {}", .0)]
+    RkyvSerializeError(String),
+}
+
+impl From<CompositeSerializerError<std::convert::Infallible, AllocScratchError, SharedSerializeMapError>> for Error {
+    fn from(value: CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>) -> Self {
+        Error::RkyvSerializeError(format!("{value:?}"))
+    }
 }
 
 impl VhrdDb {
@@ -65,7 +77,7 @@ impl VhrdDb {
         todo!()
     }
 
-    pub fn open_tree(&mut self, tree_name: impl AsRef<str>, root_type: (), evolution: SimpleVersion) -> Result<TreeBundle, Error> {
+    pub fn open_tree<R: Reflect>(&mut self, tree_name: impl AsRef<str>, evolution: SimpleVersion) -> Result<TreeBundle, Error> {
         let tree_name = tree_name.as_ref();
         match self.open_trees.get(tree_name) {
             Some(tree) => Ok(tree.clone()),
@@ -77,12 +89,16 @@ impl VhrdDb {
                     }
                     None => {
                         trace!("Create new tree {tree_name}");
+                        let mut tc = TypeCollection::new();
+                        R::reflect(&mut tc);
                         let descriptor = TreeDescriptor {
                             next_temporary_id: 0,
                             next_global_id: None,
                             description: "".to_string(),
-                            ts: Default::default(),
+                            ts: [(evolution, tc)].into(),
                         };
+                        let descriptor_bytes = rkyv::to_bytes::<_, 1024>(&descriptor)?;
+                        self.descriptors.insert(tree_name.as_bytes(), descriptor_bytes.as_slice())?;
                     }
                 }
                 let data = self.db.open_tree(tree_name.as_bytes())?;

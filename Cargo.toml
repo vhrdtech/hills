@@ -5,3 +5,6 @@ members = [
 	"hills-base",
 	"hills-derive",
 ]
+
+[workspace.dependencies]
+rkyv = { version = "0.7.42", features = ["validation", "strict"] }

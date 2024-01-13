@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct TypeCollection {
     pub root: String,
     pub refs: HashMap<String, TypeInfo>,
@@ -15,25 +18,33 @@ impl TypeCollection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub enum TypeInfo {
     Struct(StructInfo),
     Enum(EnumInfo),
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct StructInfo {
     pub doc: String,
     pub fields: Vec<StructField>
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct StructField {
     pub name: String,
     pub ty: String,
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct EnumInfo {
     pub doc: String,
     // pub variants: Vec<EnumVariant>,

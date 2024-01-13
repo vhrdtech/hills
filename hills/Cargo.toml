@@ -5,9 +5,10 @@ edition = "2021"
 
 [dependencies]
 sled = "0.34"
-rkyv = { version = "0.7.42", features = ["validation", "strict"] }
+rkyv = { workspace = true }
 chrono = { version = "0.4", features = ["rkyv"] }
 thiserror = "1.0"
 log = "0.4"
 
+hills-base = { path = "../hills-base" }
 hills-derive = { path = "../hills-derive" }

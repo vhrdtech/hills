@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use rkyv::{Archive, Deserialize, Serialize};
+use hills_base::TypeCollection;
 use crate::record::SimpleVersion;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
@@ -11,6 +12,6 @@ pub struct TreeDescriptor {
     
     pub description: String,
     /// Type definition for each evolution still supported.
-    /// Keep for reference.
-    pub ts: HashMap<SimpleVersion, String>,
+    /// Checked when opening a tree.
+    pub ts: HashMap<SimpleVersion, TypeCollection>,
 }
