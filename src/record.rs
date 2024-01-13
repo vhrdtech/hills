@@ -1,13 +1,18 @@
 use chrono::{DateTime, Utc};
 use rkyv::{Archive, Deserialize, Serialize};
 
+/// Tree key, uniquely identifying a particular record's revision.
+/// Stays fixed after creation.
 #[derive(Archive, Serialize, Deserialize)]
 pub struct Key {
     /// Unique ID of an entry inside a Tree.
     pub id: RecordId,
+    /// Each record starts with revision 0 with RecordState::Draft.
+    /// Record's data can be modified while in Draft, then it stays fixed.
     pub revision: u32,
 }
 
+/// Tree record holding modification dates, who is currently editing an entry or not, and data itself.
 #[derive(Archive, Serialize, Deserialize)]
 pub struct Record {
     /// Same ID as in key
@@ -23,6 +28,7 @@ pub struct Record {
     state: RecordState,
     modified: DateTime<Utc>,
     created: DateTime<Utc>,
+    /// Additional metadata accessible by user.
     meta: Vec<u8>,
 
     /// Rust version of the program, that serialized the data.
@@ -32,7 +38,8 @@ pub struct Record {
     /// User program version used to serialize the data.
     evolution: SimpleVersion,
 
-    data: Vec<u8>,
+    /// None when only id was created, but no data has been written yet.
+    data: Option<Vec<u8>>,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
