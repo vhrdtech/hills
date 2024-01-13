@@ -1,12 +1,15 @@
 use chrono::{DateTime, Utc};
+use rkyv::{Archive, Deserialize, Serialize};
 use crate::{RecordState, SimpleVersion};
 
+#[derive(Archive, Serialize, Deserialize)]
 pub struct Key {
     /// Unique ID of an entry inside a Tree.
     pub id: u64,
     pub revision: Revision,
 }
 
+#[derive(Archive, Serialize, Deserialize)]
 pub struct Record {
     /// Same ID as in key
     id: u64,
@@ -33,9 +36,11 @@ pub struct Record {
     data: Vec<u8>,
 }
 
+#[derive(Archive, Serialize, Deserialize)]
 pub enum Revision {
     Staging,
     Released(u32)
 }
 
+#[derive(Archive, Serialize, Deserialize)]
 pub struct NodeId(u64);
