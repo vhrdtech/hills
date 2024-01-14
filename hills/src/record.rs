@@ -78,3 +78,9 @@ pub struct SimpleVersion {
     /// Backwards and Future compatible changes
     pub minor: u16,
 }
+
+impl SimpleVersion {
+    pub const fn new(major: u16, minor: u16) -> SimpleVersion {
+        SimpleVersion { major, minor }
+    }
+}

@@ -30,7 +30,6 @@ pub enum TypeInfo {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct StructInfo {
-    pub doc: String,
     pub fields: Vec<StructField>,
 }
 
@@ -52,7 +51,6 @@ impl PartialEq for StructField {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct EnumInfo {
-    pub doc: String,
     pub variants: Vec<EnumVariant>,
 }
 

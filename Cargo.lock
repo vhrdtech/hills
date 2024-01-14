@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "hills_base",
  "proc-macro-error",
+ "proc-macro2",
  "quote",
  "syn 2.0.48",
 ]
