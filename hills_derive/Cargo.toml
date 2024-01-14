@@ -1,5 +1,5 @@
 [package]
-name = "hills-derive"
+name = "hills_derive"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,4 +12,4 @@ quote = "1.0"
 proc-macro-error = "1.0"
 
 [dev-dependencies]
-hills-base = { path = "../hills_base" }
+hills_base = { path = "../hills_base" }

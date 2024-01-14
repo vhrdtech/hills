@@ -3,11 +3,11 @@
   <component name="NewModuleRootManager" inherit-compiler-output="true">
     <exclude-output />
     <content url="file://$MODULE_DIR$">
-      <sourceFolder url="file://$MODULE_DIR$/hills-base/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/hills-derive/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/hills-derive/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/hills/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/hills_base/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/hills_derive/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/hills_derive/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

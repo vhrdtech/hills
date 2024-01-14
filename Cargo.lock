@@ -202,8 +202,8 @@ name = "hills"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "hills-base",
- "hills-derive",
+ "hills_base",
+ "hills_derive",
  "log",
  "rkyv",
  "sled",
@@ -211,17 +211,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "hills-base"
+name = "hills_base"
 version = "0.1.0"
 dependencies = [
  "rkyv",
 ]
 
 [[package]]
-name = "hills-derive"
+name = "hills_derive"
 version = "0.1.0"
 dependencies = [
- "hills-base",
+ "hills_base",
  "proc-macro-error",
  "quote",
  "syn 2.0.48",
