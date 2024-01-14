@@ -90,7 +90,13 @@ fn collect_docs(attrs: &[Attribute]) -> String {
     doc
 }
 
-const STD_TYPES: [&str; 12] = ["u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64"];
+const STD_TYPES: [&str; 17] = [
+    "u8", "u16", "u32", "u64", "u128",
+    "i8", "i16", "i32", "i64", "i128",
+    "f32", "f64",
+    "bool",
+    "String", "Vec", "HashMap", "HashSet"
+];
 
 fn ty_to_str(ty: &Type) -> String {
     match ty {

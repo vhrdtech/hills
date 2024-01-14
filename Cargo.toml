@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
 	"hills",
-	"hills-base",
-	"hills-derive",
+	"hills_base",
+	"hills_derive",
 ]
 
 [workspace.dependencies]

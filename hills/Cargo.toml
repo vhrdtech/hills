@@ -10,5 +10,5 @@ chrono = { version = "0.4", features = ["rkyv"] }
 thiserror = "1.0"
 log = "0.4"
 
-hills-base = { path = "../hills-base" }
-hills-derive = { path = "../hills-derive" }
+hills-base = { path = "../hills_base" }
+hills-derive = { path = "../hills_derive" }
