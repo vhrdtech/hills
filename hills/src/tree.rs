@@ -1,4 +1,4 @@
-use crate::record::SimpleVersion;
+use hills_base::SimpleVersion;
 use hills_base::TypeCollection;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;

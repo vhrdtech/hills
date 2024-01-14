@@ -1,7 +1,7 @@
-use crate::record::{RecordId, SimpleVersion};
+use crate::record::RecordId;
 use crate::sync::NodeKind;
 use crate::tree::TreeDescriptor;
-use hills_base::{Reflect, TypeCollection};
+use hills_base::{Reflect, SimpleVersion, TypeCollection};
 use log::trace;
 use rkyv::check_archived_root;
 use rkyv::ser::serializers::{

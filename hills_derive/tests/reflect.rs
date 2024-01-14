@@ -25,8 +25,8 @@ fn struct_test() {
     let mut tc = TypeCollection::new();
     MyStruct::reflect(&mut tc);
     // println!("{tc:#?}");
-    assert_eq!(tc.root, "basic::MyStruct");
-    let my_struct = tc.refs.get("basic::MyStruct").unwrap();
+    assert_eq!(tc.root, "MyStruct");
+    let my_struct = tc.refs.get("MyStruct").unwrap();
     assert!(matches!(my_struct, TypeInfo::Struct(_)));
     if let TypeInfo::Struct(s) = my_struct {
         let mut fields = s.fields.iter();
@@ -41,7 +41,7 @@ fn struct_test() {
         assert_eq!(field_z.ty, "NonStandard");
     }
 
-    let non_standard = tc.refs.get("basic::NonStandard").unwrap();
+    let non_standard = tc.refs.get("NonStandard").unwrap();
     assert!(matches!(non_standard, TypeInfo::Struct(_)));
     if let TypeInfo::Struct(s) = non_standard {
         let mut fields = s.fields.iter();
@@ -56,7 +56,7 @@ fn enum_test() {
     let mut tc = TypeCollection::new();
     MyEnum::reflect(&mut tc);
     // println!("{tc:#?}");
-    let my_enum = tc.refs.get("basic::MyEnum").unwrap();
+    let my_enum = tc.refs.get("MyEnum").unwrap();
     assert!(matches!(my_enum, TypeInfo::Enum(_)));
     if let TypeInfo::Enum(e) = my_enum {
         let mut variants = e.variants.iter();

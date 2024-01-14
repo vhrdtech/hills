@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use hills_base::SimpleVersion;
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Tree key, uniquely identifying a particular record's revision.
@@ -67,20 +68,4 @@ pub enum RecordState {
     /// Record is released and it's data cannot be changed.
     /// u32 can be used for other user states (Approved, Obsolete, etc), that can be changed.
     Released(u32),
-}
-
-#[derive(Archive, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(PartialEq, Eq, Debug, Hash))]
-pub struct SimpleVersion {
-    /// Backwards compatibility breaking
-    pub major: u16,
-    /// Backwards and Future compatible changes
-    pub minor: u16,
-}
-
-impl SimpleVersion {
-    pub const fn new(major: u16, minor: u16) -> SimpleVersion {
-        SimpleVersion { major, minor }
-    }
 }

@@ -36,12 +36,13 @@ pub fn reflect_fn(input: TokenStream) -> TokenStream {
         ));
     }
 
-    let struct_ident = input.ident;
-    let struct_ident_str = struct_ident.to_string();
+    let ident = input.ident;
+    let ident_str = ident.to_string();
+    // let ty_name = format!("{}::{}", module_path!(), #ident_str);
     quote!(
-        impl hills_base::Reflect for #struct_ident {
+        impl hills_base::Reflect for #ident {
             fn reflect(to: &mut hills_base::TypeCollection) {
-                let ty_name = format!("{}::{}", module_path!(), #struct_ident_str);
+                let ty_name = #ident_str.to_string();
                 if to.root.is_empty() {
                     to.root = ty_name.clone();
                 }
