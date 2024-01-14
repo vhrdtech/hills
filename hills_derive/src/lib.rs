@@ -62,6 +62,23 @@ pub fn evolve(attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+#[proc_macro_attribute]
+pub fn rkyv_common_derives(_args: TokenStream, input: TokenStream) -> TokenStream {
+    let mut output = TokenStream::from(quote! {
+        #[derive(
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+            Debug,
+            PartialEq,
+        )]
+        #[archive(check_bytes)]
+        #[archive_attr(derive(Debug))]
+    });
+    output.extend(input);
+    output
+}
+
 // fn collect_docs(attrs: &[Attribute]) -> String {
 //     let mut doc = String::new();
 //     for attr in attrs {
