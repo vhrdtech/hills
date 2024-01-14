@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use rkyv::{Archive, Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
@@ -13,7 +13,7 @@ impl TypeCollection {
     pub fn new() -> TypeCollection {
         TypeCollection {
             root: String::new(),
-            refs: HashMap::new()
+            refs: HashMap::new(),
         }
     }
 }
@@ -31,15 +31,21 @@ pub enum TypeInfo {
 #[archive_attr(derive(Debug))]
 pub struct StructInfo {
     pub doc: String,
-    pub fields: Vec<StructField>
+    pub fields: Vec<StructField>,
 }
 
-#[derive(Archive, Debug, Serialize, Deserialize)]
+#[derive(Archive, Debug, Eq, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct StructField {
-    pub name: String,
+    pub ident: String,
     pub ty: String,
+}
+
+impl PartialEq for StructField {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+    }
 }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
@@ -47,13 +53,25 @@ pub struct StructField {
 #[archive_attr(derive(Debug))]
 pub struct EnumInfo {
     pub doc: String,
-    // pub variants: Vec<EnumVariant>,
+    pub variants: Vec<EnumVariant>,
 }
 
-// pub struct EnumVariant {
-//     pub name: String,
-//     pub
-// }
+#[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub struct EnumVariant {
+    pub ident: String,
+    pub fields: EnumFields,
+}
+
+#[derive(Archive, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
+pub enum EnumFields {
+    Named(Vec<StructField>),
+    Unnamed(Vec<String>),
+    Unit,
+}
 
 pub trait Reflect {
     fn reflect(to: &mut TypeCollection);

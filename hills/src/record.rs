@@ -54,7 +54,7 @@ pub enum RecordId {
     /// be acquired from the server and AssignGlobalId action will change them.
     Temporary(u32),
     /// Global id across all nodes, so that relations can be created using such ids.
-    Global(u32)
+    Global(u32),
 }
 
 /// Record state
