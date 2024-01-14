@@ -13,5 +13,5 @@ pub struct TreeDescriptor {
     pub description: String,
     /// Type definition for each evolution still supported.
     /// Checked when opening a tree.
-    pub ts: HashMap<SimpleVersion, TypeCollection>,
+    pub evolutions: HashMap<SimpleVersion, TypeCollection>,
 }

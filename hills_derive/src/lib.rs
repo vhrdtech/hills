@@ -69,6 +69,8 @@ pub fn rkyv_common_derives(_args: TokenStream, input: TokenStream) -> TokenStrea
             rkyv::Archive,
             rkyv::Serialize,
             rkyv::Deserialize,
+            hills_derive::Reflect,
+            Clone,
             Debug,
             PartialEq,
         )]
