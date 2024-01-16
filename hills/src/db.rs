@@ -124,17 +124,14 @@ impl VhrdDb {
         todo!()
     }
 
-    pub fn open_tree<K, V>(
-        &mut self,
-        tree_name: impl AsRef<str>,
-        evolution: SimpleVersion,
-    ) -> Result<TreeBundle<K, V>, Error>
+    pub fn open_tree<K, V>(&mut self, tree_name: impl AsRef<str>) -> Result<TreeBundle<K, V>, Error>
     where
         K: TreeKey,
         V: TreeRoot + Reflect,
     {
         let tree_name = tree_name.as_ref();
         let key_tree_name = <K as TreeKey>::tree_name();
+        let evolution = <V as TreeRoot>::evolution();
         if key_tree_name != tree_name {
             return Err(Error::WrongKey(
                 key_tree_name.to_string(),

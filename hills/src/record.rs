@@ -8,11 +8,10 @@ pub struct Record {
     /// Same ID as in key
     key: GenericKey,
 
-    /// Whether some node is holding an entry mutable or not.
-    /// If node id is not self, then no modifications should be done to an entry.
-    /// Server must reject modified entries from a node if they weren't first checked out by the same node.
-    held_mut_by: Option<NodeId>,
-
+    // Whether some node is holding an entry mutable or not.
+    // If node id is not self, then no modifications should be done to an entry.
+    // Server must reject modified entries from a node if they weren't first checked out by the same node.
+    // held_mut_by: Option<NodeId>,
     state: RecordState,
     modified: DateTime<Utc>,
     created: DateTime<Utc>,

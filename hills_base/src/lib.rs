@@ -14,4 +14,5 @@ pub trait Reflect {
 
 pub trait TreeRoot {
     fn tree_name() -> &'static str;
+    fn evolution() -> SimpleVersion;
 }
