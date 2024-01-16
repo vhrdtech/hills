@@ -269,7 +269,7 @@ where
         Ok(())
     }
 
-    pub fn get_deserialized(&self, key: K) -> Result<Option<V>, Error> {
+    pub fn get(&self, key: K) -> Result<Option<V>, Error> {
         let value = self.data.get(key.to_generic().as_bytes())?;
         match value {
             Some(bytes) => {
@@ -278,6 +278,21 @@ where
                 Ok(Some(deserialized))
             }
             None => Ok(None),
+        }
+    }
+
+    pub fn get_archived<F: FnMut(Option<&V::Archived>) -> R, R>(
+        &self,
+        key: K,
+        mut f: F,
+    ) -> Result<R, Error> {
+        let value = self.data.get(key.to_generic().as_bytes())?;
+        match value {
+            Some(bytes) => {
+                let archived = check_archived_root::<V>(&bytes)?;
+                Ok(f(Some(archived)))
+            }
+            None => Ok(f(None)),
         }
     }
 
