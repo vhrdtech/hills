@@ -1,7 +1,8 @@
 use crate::record::RecordId;
 use crate::sync::NodeKind;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
-use hills_base::{Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
+use hills_base::zerocopy::{AsBytes, FromBytes};
+use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
 use rkyv::ser::serializers::{
     AllocScratchError, AllocSerializer, CompositeSerializerError, SharedSerializeMapError,
@@ -29,7 +30,7 @@ struct RawTreeBundle {
     data: Tree,
     /// Monotonic serial -> JournalEntry
     journal: Tree,
-    /// Monotonic index -> Key for all the latest revisions
+    /// All latest revisions -> ()
     latest_revision_index: Tree,
 }
 
@@ -171,7 +172,7 @@ impl VhrdDb {
                             .max()
                             .unwrap_or(SimpleVersion::new(0, 0));
                         trace!(
-                            "Checking existing tree {tree_name} with max evolution {}",
+                            "Checking existing tree '{tree_name}' with latest evolution: {}",
                             max_evolution
                         );
                         // if evolution < current_evolution {
@@ -196,6 +197,7 @@ impl VhrdDb {
                                     if current_tc != known_tc {
                                         return Err(Error::EvolutionMismatch("Type definitions changed compared to what's in the database".into()));
                                     }
+                                    trace!("Type definitions matches exactly");
                                 }
                                 None => {
                                     warn!(
@@ -251,21 +253,24 @@ impl VhrdDb {
 
 impl<K, V> TreeBundle<K, V>
 where
-    K: TreeKey + Archive + Serialize<AllocSerializer<4>>,
+    K: TreeKey,
     V: TreeRoot + Archive + Serialize<AllocSerializer<128>>,
     <V as Archive>::Archived:
         Deserialize<V, rkyv::Infallible> + for<'a> CheckBytes<DefaultValidator<'a>>,
 {
     pub fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
-        let key = rkyv::to_bytes::<_, 4>(&key)?;
+        let key = key.to_generic();
         let value = rkyv::to_bytes::<_, 128>(&value)?;
-        self.data.insert(&key, &*value)?;
+        self.data.insert(key.as_bytes(), &*value)?;
+        if let Some(previous) = key.previous_revision() {
+            self.latest_revision_index.remove(previous.as_bytes())?;
+        }
+        self.latest_revision_index.insert(key.as_bytes(), &[])?;
         Ok(())
     }
 
     pub fn get_deserialized(&self, key: K) -> Result<Option<V>, Error> {
-        let key = rkyv::to_bytes::<_, 4>(&key)?;
-        let value = self.data.get(key)?;
+        let value = self.data.get(key.to_generic().as_bytes())?;
         match value {
             Some(bytes) => {
                 let archived = check_archived_root::<V>(&bytes)?;
@@ -273,6 +278,15 @@ where
                 Ok(Some(deserialized))
             }
             None => Ok(None),
+        }
+    }
+
+    pub fn latest_revisions(&self) {
+        for key in self.latest_revision_index.iter().keys() {
+            if let Ok(key) = key {
+                let key = GenericKey::read_from(&key);
+                println!("{key:?}");
+            }
         }
     }
 }
