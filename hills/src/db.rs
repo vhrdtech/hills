@@ -1,7 +1,6 @@
 use crate::record::RecordId;
 use crate::sync::NodeKind;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
-use hills_base::zerocopy::{AsBytes, FromBytes};
 use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
 use rkyv::ser::serializers::{
@@ -9,7 +8,7 @@ use rkyv::ser::serializers::{
 };
 use rkyv::validation::validators::{DefaultValidator, DefaultValidatorError};
 use rkyv::validation::CheckArchiveError;
-use rkyv::{check_archived_root, Archive, CheckBytes, Deserialize, Fallible, Serialize};
+use rkyv::{check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Fallible, Serialize};
 use sled::{Db, Tree};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -260,17 +259,19 @@ where
 {
     pub fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
         let key = key.to_generic();
-        let value = rkyv::to_bytes::<_, 128>(&value)?;
-        self.data.insert(key.as_bytes(), &*value)?;
+        let key_bytes = to_bytes::<_, 0>(&key)?;
+        let value = to_bytes::<_, 128>(&value)?;
+        self.data.insert(&key_bytes, &*value)?;
         if let Some(previous) = key.previous_revision() {
-            self.latest_revision_index.remove(previous.as_bytes())?;
+            self.latest_revision_index
+                .remove(&to_bytes::<_, 0>(&previous)?)?;
         }
-        self.latest_revision_index.insert(key.as_bytes(), &[])?;
+        self.latest_revision_index.insert(&key_bytes, &[])?;
         Ok(())
     }
 
     pub fn get(&self, key: K) -> Result<Option<V>, Error> {
-        let value = self.data.get(key.to_generic().as_bytes())?;
+        let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
         match value {
             Some(bytes) => {
                 let archived = check_archived_root::<V>(&bytes)?;
@@ -286,7 +287,7 @@ where
         key: K,
         mut f: F,
     ) -> Result<R, Error> {
-        let value = self.data.get(key.to_generic().as_bytes())?;
+        let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
         match value {
             Some(bytes) => {
                 let archived = check_archived_root::<V>(&bytes)?;
@@ -296,12 +297,27 @@ where
         }
     }
 
-    pub fn latest_revisions(&self) {
-        for key in self.latest_revision_index.iter().keys() {
+    pub fn latest_revisions(&self) -> impl Iterator<Item = GenericKey> {
+        self.latest_revision_index.iter().keys().filter_map(|key| {
             if let Ok(key) = key {
-                let key = GenericKey::read_from(&key);
-                println!("{key:?}");
+                if key.len() < 8 {
+                    warn!("Wrong key in latest_revisions");
+                    return None;
+                }
+                // Alignment 2 is returned here (:
+                // let key = unsafe { rkyv::archived_root::<GenericKey>(&key) };
+                // let key: GenericKey = key.deserialize(&mut rkyv::Infallible)?;
+                let mut word = [0u8; 4];
+                word.copy_from_slice(&key[0..=3]);
+                let id = u32::from_le_bytes(word);
+                word.copy_from_slice(&key[4..=7]);
+                let revision = u32::from_le_bytes(word);
+                let key = GenericKey { id, revision };
+                Some(key)
+            } else {
+                warn!("Err in latest_revisions");
+                None
             }
-        }
+        })
     }
 }

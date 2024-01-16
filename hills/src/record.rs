@@ -1,25 +1,12 @@
 use chrono::{DateTime, Utc};
-use hills_base::SimpleVersion;
+use hills_base::{GenericKey, SimpleVersion};
 use rkyv::{Archive, Deserialize, Serialize};
-
-/// Tree key, uniquely identifying a particular record's revision.
-/// Stays fixed after creation.
-#[derive(Archive, Serialize, Deserialize)]
-pub struct Key {
-    /// Unique ID of an entry inside a Tree.
-    pub id: RecordId,
-    /// Each record starts with revision 0 with RecordState::Draft.
-    /// Record's data can be modified while in Draft, then it stays fixed.
-    pub revision: u32,
-}
 
 /// Tree record holding modification dates, who is currently editing an entry or not, and data itself.
 #[derive(Archive, Serialize, Deserialize)]
 pub struct Record {
     /// Same ID as in key
-    id: RecordId,
-    /// Same revision as in key
-    revision: u32,
+    key: GenericKey,
 
     /// Whether some node is holding an entry mutable or not.
     /// If node id is not self, then no modifications should be done to an entry.

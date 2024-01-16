@@ -1,5 +1,4 @@
-use zerocopy::big_endian::U32;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use rkyv::{Archive, Deserialize, Serialize};
 
 pub trait TreeKey {
     fn tree_name() -> &'static str;
@@ -7,26 +6,24 @@ pub trait TreeKey {
     fn to_generic(&self) -> GenericKey;
 }
 
-#[derive(Debug, FromBytes, AsBytes, FromZeroes)]
-#[repr(C)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct GenericKey {
-    pub id: U32,
-    pub revision: U32,
+    pub id: u32,
+    pub revision: u32,
 }
 
 impl GenericKey {
     pub fn new(id: u32, revision: u32) -> Self {
-        GenericKey {
-            id: id.into(),
-            revision: revision.into(),
-        }
+        GenericKey { id, revision }
     }
 
     pub fn previous_revision(&self) -> Option<Self> {
-        if self.revision.get() > 0 {
+        if self.revision > 0 {
             Some(GenericKey {
                 id: self.id,
-                revision: (self.revision.get() - 1).into(),
+                revision: self.revision - 1,
             })
         } else {
             None

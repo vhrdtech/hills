@@ -7,7 +7,6 @@ pub use evolution_check::is_backwards_compatible;
 pub use generic_key::{GenericKey, TreeKey};
 pub use simple_ast::*;
 pub use simple_version::*;
-pub use zerocopy;
 
 pub trait Reflect {
     fn reflect(to: &mut TypeCollection);
