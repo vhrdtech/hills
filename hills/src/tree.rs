@@ -14,4 +14,5 @@ pub struct TreeDescriptor {
     /// Type definition for each evolution still supported.
     /// Checked when opening a tree.
     pub evolutions: HashMap<SimpleVersion, TypeCollection>,
+    pub versioning: bool,
 }

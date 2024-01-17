@@ -14,7 +14,7 @@ pub struct Record {
     // If node id is not self, then no modifications should be done to an entry.
     // Server must reject modified entries from a node if they weren't first checked out by the same node.
     // held_mut_by: Option<NodeId>,
-    pub state: RecordState,
+    pub version: Version,
 
     pub last_edited_by: String,
     pub modified: DateTime<Utc>,
@@ -40,7 +40,7 @@ pub struct Record {
 #[derive(Archive, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
-pub enum RecordState {
+pub enum Version {
     NonVersioned,
     /// Record can be edited many times, only latest data is kept and synchronised between nodes
     Draft,

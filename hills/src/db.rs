@@ -1,5 +1,5 @@
-use crate::record::ArchivedRecordState;
-use crate::record::{Record, RecordState};
+use crate::record::ArchivedVersion;
+use crate::record::{Record, Version};
 use crate::sync::NodeKind;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use chrono::Utc;
@@ -11,10 +11,8 @@ use rkyv::ser::serializers::{
 };
 use rkyv::validation::validators::{DefaultValidator, DefaultValidatorError};
 use rkyv::validation::CheckArchiveError;
-use rkyv::vec::ArchivedVec;
 use rkyv::{
-    archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Fallible,
-    Serialize,
+    archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Serialize,
 };
 use sled::{Db, Tree};
 use std::collections::HashMap;
@@ -38,6 +36,7 @@ struct RawTreeBundle {
     journal: Tree,
     /// All latest revisions -> ()
     latest_revision_index: Tree,
+    versioning: bool,
 }
 
 #[derive(Clone)]
@@ -50,7 +49,8 @@ pub struct TreeBundle<K, V> {
     latest_revision_index: Tree,
 
     username: String,
-
+    versioning: bool,
+    // id_pool: Range<u32>,
     _phantom_k: PhantomData<K>,
     _phantom_v: PhantomData<V>,
 }
@@ -143,6 +143,7 @@ impl VhrdDb {
         &mut self,
         tree_name: impl AsRef<str>,
         username: impl AsRef<str>,
+        versioning: bool,
     ) -> Result<TreeBundle<K, V>, Error>
     where
         K: TreeKey,
@@ -171,6 +172,7 @@ impl VhrdDb {
                 journal: tree.journal.clone(),
                 latest_revision_index: tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
+                versioning: tree.versioning,
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
             }),
@@ -191,6 +193,11 @@ impl VhrdDb {
                             "Checking existing tree '{tree_name}' with latest evolution: {}",
                             max_evolution
                         );
+                        if versioning != descriptor.versioning {
+                            return Err(Error::VersioningMismatch(
+                                "Cannot change versioning of a tree after creation".to_owned(),
+                            ));
+                        }
                         // if evolution < current_evolution {
                         //     return Err(Error::EvolutionMismatch("Code evolution is older than database already have".into()));
                         // }
@@ -235,6 +242,7 @@ impl VhrdDb {
                             next_global_id: None,
                             description: "".to_string(),
                             evolutions: [(evolution, current_tc)].into(),
+                            versioning,
                         };
                         let descriptor_bytes = rkyv::to_bytes::<_, 1024>(&descriptor)?;
                         self.descriptors
@@ -252,6 +260,7 @@ impl VhrdDb {
                     data,
                     journal,
                     latest_revision_index,
+                    versioning,
                 };
                 self.open_trees
                     .insert(tree_name.to_string(), bundle.clone());
@@ -260,6 +269,7 @@ impl VhrdDb {
                     journal: bundle.journal,
                     latest_revision_index: bundle.latest_revision_index,
                     username: username.as_ref().to_string(),
+                    versioning,
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
                 })
@@ -280,7 +290,7 @@ where
         let key_bytes = to_bytes::<_, 0>(&key)?;
         if let Some(replacing) = self.data.get(&key_bytes)? {
             let replacing = unsafe { archived_root::<Record>(&replacing) };
-            if matches!(replacing.state, ArchivedRecordState::Released(_)) {
+            if matches!(replacing.version, ArchivedVersion::Released(_)) {
                 return Err(Error::VersioningMismatch(format!(
                     "Cannot replace Released record {key:?}"
                 )));
@@ -299,15 +309,20 @@ where
                 )));
             };
             let previous_record = unsafe { archived_root::<Record>(&previous_record) };
-            if !matches!(previous_record.state, ArchivedRecordState::Released(_)) {
+            if matches!(previous_record.version, ArchivedVersion::Draft) {
                 return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
             }
             self.latest_revision_index.remove(previous)?;
         }
         let value = to_bytes::<_, 128>(&value)?;
+        let versioning = if self.versioning {
+            Version::Draft
+        } else {
+            Version::NonVersioned
+        };
         let record = Record {
             key,
-            state: RecordState::NonVersioned,
+            version: versioning,
             last_edited_by: self.username.clone(),
             modified: Utc::now(),
             created: Utc::now(),
