@@ -1,3 +1,4 @@
+use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::record::ArchivedVersion;
 use crate::record::{Record, Version};
 use crate::sync::NodeKind;
@@ -14,11 +15,15 @@ use rkyv::validation::CheckArchiveError;
 use rkyv::{
     archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Serialize,
 };
-use sled::{Db, Tree};
+use sled::transaction::{ConflictableTransactionError, TransactionError};
+use sled::{Db, IVec, Tree};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 pub struct VhrdDb {
@@ -86,6 +91,9 @@ pub enum Error {
 
     #[error("{}", .0)]
     VersioningMismatch(String),
+
+    #[error("Pool of available keys depleted")]
+    OutOfKeys,
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -98,7 +106,7 @@ impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializ
     }
 }
 
-impl<T: core::fmt::Debug> From<CheckArchiveError<T, DefaultValidatorError>> for Error {
+impl<T: Debug> From<CheckArchiveError<T, DefaultValidatorError>> for Error {
     fn from(value: CheckArchiveError<T, DefaultValidatorError>) -> Self {
         Error::RkyvDeserializeError(format!("{value:?}"))
     }
@@ -107,6 +115,15 @@ impl<T: core::fmt::Debug> From<CheckArchiveError<T, DefaultValidatorError>> for 
 impl From<Infallible> for Error {
     fn from(_value: Infallible) -> Self {
         Error::RkyvDeserializeError("Infallible".into())
+    }
+}
+
+impl<T: Debug> From<TransactionError<T>> for Error {
+    fn from(value: TransactionError<T>) -> Self {
+        match value {
+            TransactionError::Abort(e) => Error::Internal(format!("{e:?}")),
+            TransactionError::Storage(e) => Error::Sled(e),
+        }
     }
 }
 
@@ -167,12 +184,12 @@ impl VhrdDb {
         }
 
         match self.open_trees.get(tree_name) {
-            Some(tree) => Ok(TreeBundle {
-                data: tree.data.clone(),
-                journal: tree.journal.clone(),
-                latest_revision_index: tree.latest_revision_index.clone(),
+            Some(raw_tree) => Ok(TreeBundle {
+                data: raw_tree.data.clone(),
+                journal: raw_tree.journal.clone(),
+                latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
-                versioning: tree.versioning,
+                versioning: raw_tree.versioning,
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
             }),
@@ -256,6 +273,7 @@ impl VhrdDb {
                 let latest_revision_index = self
                     .db
                     .open_tree(format!("{tree_name}_latest_revision_index").as_bytes())?;
+
                 let bundle = RawTreeBundle {
                     data,
                     journal,
@@ -285,35 +303,98 @@ where
     <V as Archive>::Archived:
         Deserialize<V, rkyv::Infallible> + for<'a> CheckBytes<DefaultValidator<'a>>,
 {
-    pub fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
-        let key = key.to_generic();
+    // TODO: should not be pub
+    pub fn feed_key_pool(&mut self, additional_range: Range<u32>) -> Result<(), Error> {
+        self.data
+            .transaction(|tx_db| match tx_db.get("_key_pool".as_bytes())? {
+                Some(key_pool) => {
+                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                        .map_err(|_| {
+                            ConflictableTransactionError::Abort("get_next_key: check_archived_root")
+                        })?;
+                    let mut key_pool: KeyPool =
+                        key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
+                            ConflictableTransactionError::Abort("get_next_key: deserialize")
+                        })?;
+                    key_pool.push(additional_range.clone());
+                    let key_pool = to_bytes::<_, 8>(&key_pool)
+                        .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                    tx_db.insert("_key_pool".as_bytes(), &*key_pool)?;
+                    Ok(Ok(()))
+                }
+                None => {
+                    let key_pool = KeyPool::new(vec![additional_range.clone()]);
+                    let key_pool = to_bytes::<_, 8>(&key_pool)
+                        .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                    tx_db.insert("_key_pool".as_bytes(), &*key_pool)?;
+                    Ok(Ok(()))
+                }
+            })?
+    }
+
+    fn get_next_key(&mut self) -> Result<u32, Error> {
+        self.data
+            .transaction(|tx_db| match tx_db.get("_key_pool".as_bytes())? {
+                Some(key_pool) => {
+                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                        .map_err(|_| {
+                            ConflictableTransactionError::Abort("get_next_key: check_archived_root")
+                        })?;
+                    let mut key_pool: KeyPool =
+                        key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
+                            ConflictableTransactionError::Abort("get_next_key: deserialize")
+                        })?;
+                    let next_key = match key_pool.get() {
+                        Some(next_key) => {
+                            let key_pool = to_bytes::<_, 8>(&key_pool)
+                                .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                            tx_db.insert("_key_pool".as_bytes(), &*key_pool)?;
+                            next_key
+                        }
+                        None => {
+                            return Ok(Err(Error::OutOfKeys));
+                        }
+                    };
+                    Ok(Ok(next_key))
+                }
+                None => Ok(Err(Error::OutOfKeys)),
+            })?
+    }
+
+    pub fn insert(&mut self, value: V) -> Result<K, Error> {
+        let key = self.get_next_key()?;
+        let key = GenericKey::new(key, 0);
         let key_bytes = to_bytes::<_, 0>(&key)?;
-        if let Some(replacing) = self.data.get(&key_bytes)? {
-            let replacing = unsafe { archived_root::<Record>(&replacing) };
-            if matches!(replacing.version, ArchivedVersion::Released(_)) {
-                return Err(Error::VersioningMismatch(format!(
-                    "Cannot replace Released record {key:?}"
-                )));
-            }
+
+        if self.data.contains_key(&key_bytes)? {
+            return Err(Error::Internal("Duplicate key from KeyPool".to_string()));
         }
-        if let Some(previous) = key.previous_revision() {
-            let previous = &to_bytes::<_, 0>(&previous)?;
-            if !self.latest_revision_index.contains_key(previous)? {
-                return Err(Error::VersioningMismatch(format!(
-                    "Cannot insert next revision without previous {key:?}"
-                )));
-            }
-            let Some(previous_record) = self.data.get(&previous)? else {
-                return Err(Error::Internal(format!(
-                    "Previous version of {key:?} is not in the data tree"
-                )));
-            };
-            let previous_record = unsafe { archived_root::<Record>(&previous_record) };
-            if matches!(previous_record.version, ArchivedVersion::Draft) {
-                return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
-            }
-            self.latest_revision_index.remove(previous)?;
-        }
+        // if let Some(replacing) = self.data.get(&key_bytes)? {
+        //     let replacing = unsafe { archived_root::<Record>(&replacing) };
+        //     if matches!(replacing.version, ArchivedVersion::Released(_)) {
+        //         return Err(Error::VersioningMismatch(format!(
+        //             "Cannot replace Released record {key:?}"
+        //         )));
+        //     }
+        // }
+        // if let Some(previous) = key.previous_revision() {
+        //     let previous = &to_bytes::<_, 0>(&previous)?;
+        //     if !self.latest_revision_index.contains_key(previous)? {
+        //         return Err(Error::VersioningMismatch(format!(
+        //             "Cannot insert next revision without previous {key:?}"
+        //         )));
+        //     }
+        //     let Some(previous_record) = self.data.get(&previous)? else {
+        //         return Err(Error::Internal(format!(
+        //             "Previous version of {key:?} is not in the data tree"
+        //         )));
+        //     };
+        //     let previous_record = unsafe { archived_root::<Record>(&previous_record) };
+        //     if matches!(previous_record.version, ArchivedVersion::Draft) {
+        //         return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
+        //     }
+        //     self.latest_revision_index.remove(previous)?;
+        // }
         let value = to_bytes::<_, 128>(&value)?;
         let versioning = if self.versioning {
             Version::Draft
@@ -335,7 +416,7 @@ where
         let record = to_bytes::<_, 128>(&record)?;
         self.data.insert(&key_bytes, &*record)?;
         self.latest_revision_index.insert(&key_bytes, &[])?;
-        Ok(())
+        Ok(K::new(key))
     }
 
     pub fn get(&self, key: K) -> Result<Option<V>, Error> {
