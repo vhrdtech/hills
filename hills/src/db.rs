@@ -1,14 +1,21 @@
-use crate::record::RecordId;
+use crate::record::ArchivedRecordState;
+use crate::record::{Record, RecordState};
 use crate::sync::NodeKind;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
+use chrono::Utc;
 use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
+use rkyv::option::ArchivedOption;
 use rkyv::ser::serializers::{
     AllocScratchError, AllocSerializer, CompositeSerializerError, SharedSerializeMapError,
 };
 use rkyv::validation::validators::{DefaultValidator, DefaultValidatorError};
 use rkyv::validation::CheckArchiveError;
-use rkyv::{check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Fallible, Serialize};
+use rkyv::vec::ArchivedVec;
+use rkyv::{
+    archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Fallible,
+    Serialize,
+};
 use sled::{Db, Tree};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -42,6 +49,8 @@ pub struct TreeBundle<K, V> {
     /// Monotonic index -> Key for all the latest revisions
     latest_revision_index: Tree,
 
+    username: String,
+
     _phantom_k: PhantomData<K>,
     _phantom_v: PhantomData<V>,
 }
@@ -50,6 +59,9 @@ pub struct TreeBundle<K, V> {
 pub enum Error {
     #[error(transparent)]
     Sled(#[from] sled::Error),
+
+    #[error("{}", .0)]
+    Internal(String),
 
     #[error("Tree {} not found", .0)]
     TreeNotFound(String),
@@ -71,6 +83,9 @@ pub enum Error {
 
     #[error("Value from tree {} used with another tree {}", .0, .1)]
     WrongValue(String, String),
+
+    #[error("{}", .0)]
+    VersioningMismatch(String),
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -107,24 +122,28 @@ impl VhrdDb {
         })
     }
 
-    pub fn create_record(&mut self, tree_name: impl AsRef<str>) -> Result<RecordId, Error> {
-        let descriptor = self.descriptors.get(tree_name.as_ref().as_bytes())?;
-        let Some(descriptor) = descriptor else {
-            return Err(Error::TreeNotFound(tree_name.as_ref().to_string()));
-        };
-        let descriptor = check_archived_root::<TreeDescriptor>(&descriptor)
-            .map_err(|_| Error::RkyvCheckArchivedRoot)?;
-        trace!("{descriptor:?}");
+    // pub fn create_record(&mut self, tree_name: impl AsRef<str>) -> Result<RecordId, Error> {
+    //     let descriptor = self.descriptors.get(tree_name.as_ref().as_bytes())?;
+    //     let Some(descriptor) = descriptor else {
+    //         return Err(Error::TreeNotFound(tree_name.as_ref().to_string()));
+    //     };
+    //     let descriptor = check_archived_root::<TreeDescriptor>(&descriptor)
+    //         .map_err(|_| Error::RkyvCheckArchivedRoot)?;
+    //     trace!("{descriptor:?}");
+    //
+    //     // match self.node_kind {
+    //     //     NodeKind::Server | NodeKind::StandAlone => {}
+    //     //     NodeKind::Client => {}
+    //     //     NodeKind::Backup => {}
+    //     // }
+    //     todo!()
+    // }
 
-        // match self.node_kind {
-        //     NodeKind::Server | NodeKind::StandAlone => {}
-        //     NodeKind::Client => {}
-        //     NodeKind::Backup => {}
-        // }
-        todo!()
-    }
-
-    pub fn open_tree<K, V>(&mut self, tree_name: impl AsRef<str>) -> Result<TreeBundle<K, V>, Error>
+    pub fn open_tree<K, V>(
+        &mut self,
+        tree_name: impl AsRef<str>,
+        username: impl AsRef<str>,
+    ) -> Result<TreeBundle<K, V>, Error>
     where
         K: TreeKey,
         V: TreeRoot + Reflect,
@@ -151,6 +170,7 @@ impl VhrdDb {
                 data: tree.data.clone(),
                 journal: tree.journal.clone(),
                 latest_revision_index: tree.latest_revision_index.clone(),
+                username: username.as_ref().to_string(),
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
             }),
@@ -239,6 +259,7 @@ impl VhrdDb {
                     data: bundle.data,
                     journal: bundle.journal,
                     latest_revision_index: bundle.latest_revision_index,
+                    username: username.as_ref().to_string(),
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
                 })
@@ -257,12 +278,47 @@ where
     pub fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
         let key = key.to_generic();
         let key_bytes = to_bytes::<_, 0>(&key)?;
-        let value = to_bytes::<_, 128>(&value)?;
-        self.data.insert(&key_bytes, &*value)?;
-        if let Some(previous) = key.previous_revision() {
-            self.latest_revision_index
-                .remove(&to_bytes::<_, 0>(&previous)?)?;
+        if let Some(replacing) = self.data.get(&key_bytes)? {
+            let replacing = unsafe { archived_root::<Record>(&replacing) };
+            if matches!(replacing.state, ArchivedRecordState::Released(_)) {
+                return Err(Error::VersioningMismatch(format!(
+                    "Cannot replace Released record {key:?}"
+                )));
+            }
         }
+        if let Some(previous) = key.previous_revision() {
+            let previous = &to_bytes::<_, 0>(&previous)?;
+            if !self.latest_revision_index.contains_key(previous)? {
+                return Err(Error::VersioningMismatch(format!(
+                    "Cannot insert next revision without previous {key:?}"
+                )));
+            }
+            let Some(previous_record) = self.data.get(&previous)? else {
+                return Err(Error::Internal(format!(
+                    "Previous version of {key:?} is not in the data tree"
+                )));
+            };
+            let previous_record = unsafe { archived_root::<Record>(&previous_record) };
+            if !matches!(previous_record.state, ArchivedRecordState::Released(_)) {
+                return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
+            }
+            self.latest_revision_index.remove(previous)?;
+        }
+        let value = to_bytes::<_, 128>(&value)?;
+        let record = Record {
+            key,
+            state: RecordState::NonVersioned,
+            last_edited_by: self.username.clone(),
+            modified: Utc::now(),
+            created: Utc::now(),
+            meta: None,
+            rust_version: SimpleVersion::rust_version(),
+            rkyv_version: SimpleVersion::rkyv_version(),
+            evolution: <V as TreeRoot>::evolution(),
+            data: Some(value),
+        };
+        let record = to_bytes::<_, 128>(&record)?;
+        self.data.insert(&key_bytes, &*record)?;
         self.latest_revision_index.insert(&key_bytes, &[])?;
         Ok(())
     }
@@ -271,9 +327,16 @@ where
         let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
         match value {
             Some(bytes) => {
-                let archived = check_archived_root::<V>(&bytes)?;
-                let deserialized: V = archived.deserialize(&mut rkyv::Infallible)?;
-                Ok(Some(deserialized))
+                let archived_record = unsafe { archived_root::<Record>(&bytes) };
+
+                match &archived_record.data {
+                    ArchivedOption::Some(data) => {
+                        let archived_data = check_archived_root::<V>(data)?;
+                        let deserialized: V = archived_data.deserialize(&mut rkyv::Infallible)?;
+                        Ok(Some(deserialized))
+                    }
+                    ArchivedOption::None => Ok(None),
+                }
             }
             None => Ok(None),
         }
@@ -287,8 +350,14 @@ where
         let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
         match value {
             Some(bytes) => {
-                let archived = check_archived_root::<V>(&bytes)?;
-                Ok(f(Some(archived)))
+                let archived_record = unsafe { archived_root::<Record>(&bytes) };
+                match &archived_record.data {
+                    ArchivedOption::Some(data) => {
+                        let archived_data = check_archived_root::<V>(data)?;
+                        Ok(f(Some(archived_data)))
+                    }
+                    ArchivedOption::None => Ok(f(None)),
+                }
             }
             None => Ok(f(None)),
         }

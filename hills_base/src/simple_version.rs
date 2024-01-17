@@ -23,6 +23,17 @@ impl SimpleVersion {
             minor: self.minor,
         }
     }
+
+    pub fn rust_version() -> SimpleVersion {
+        SimpleVersion {
+            major: 1,
+            minor: 74,
+        }
+    }
+
+    pub fn rkyv_version() -> SimpleVersion {
+        SimpleVersion { major: 0, minor: 7 }
+    }
 }
 
 impl ArchivedSimpleVersion {

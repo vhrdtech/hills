@@ -1,54 +1,47 @@
 use chrono::{DateTime, Utc};
 use hills_base::{GenericKey, SimpleVersion};
-use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
-/// Tree record holding modification dates, who is currently editing an entry or not, and data itself.
+/// Tree record holding meta information, dates and data itself.
 #[derive(Archive, Serialize, Deserialize)]
+// #[archive(check_bytes)]
+// #[archive_attr(derive(Debug))]
 pub struct Record {
     /// Same ID as in key
-    key: GenericKey,
+    pub key: GenericKey,
 
     // Whether some node is holding an entry mutable or not.
     // If node id is not self, then no modifications should be done to an entry.
     // Server must reject modified entries from a node if they weren't first checked out by the same node.
     // held_mut_by: Option<NodeId>,
-    state: RecordState,
-    modified: DateTime<Utc>,
-    created: DateTime<Utc>,
+    pub state: RecordState,
+
+    pub last_edited_by: String,
+    pub modified: DateTime<Utc>,
+    pub created: DateTime<Utc>,
     /// Additional metadata accessible by user.
-    meta: Vec<u8>,
+    pub meta: Option<AlignedVec>,
 
     /// Rust version of the program, that serialized the data.
-    rust_version: SimpleVersion,
+    pub rust_version: SimpleVersion,
     /// rkyv version that was used to serialize the data.
-    rkyv_version: SimpleVersion,
+    pub rkyv_version: SimpleVersion,
     /// User program version used to serialize the data.
-    evolution: SimpleVersion,
+    pub evolution: SimpleVersion,
 
     /// None when only id was created, but no data has been written yet.
-    data: Option<Vec<u8>>,
+    pub data: Option<AlignedVec>,
 }
 
-#[derive(Archive, Serialize, Deserialize)]
-pub struct NodeId(u64);
-
-/// Record id inside a tree
-#[derive(Archive, Debug, Serialize, Deserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
-pub enum RecordId {
-    /// When offline, nodes can create new entries with temporary ids, when online global id can
-    /// be acquired from the server and AssignGlobalId action will change them.
-    Temporary(u32),
-    /// Global id across all nodes, so that relations can be created using such ids.
-    Global(u32),
-}
+// #[derive(Archive, Serialize, Deserialize)]
+// pub struct NodeId(u64);
 
 /// Record state
 #[derive(Archive, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub enum RecordState {
+    NonVersioned,
     /// Record can be edited many times, only latest data is kept and synchronised between nodes
     Draft,
     /// Record is released and it's data cannot be changed.

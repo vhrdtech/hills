@@ -1,10 +1,10 @@
-use crate::record::RecordId;
+use hills_base::GenericKey;
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Archive, Serialize, Deserialize)]
 pub struct JournalEntry {
     serial: u64,
-    id: RecordId,
+    key: GenericKey,
     action: Action,
 }
 
