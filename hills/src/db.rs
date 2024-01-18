@@ -1,12 +1,11 @@
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
-use crate::record::ArchivedVersion;
+use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::NodeKind;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use chrono::Utc;
 use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
-use rkyv::option::ArchivedOption;
 use rkyv::ser::serializers::{
     AllocScratchError, AllocSerializer, CompositeSerializerError, SharedSerializeMapError,
 };
@@ -358,16 +357,14 @@ where
         if self.data.contains_key(&key_bytes)? {
             return Err(Error::Internal("Duplicate key from KeyPool".to_string()));
         }
-        let value = to_bytes::<_, 128>(&value)?;
+        let data = to_bytes::<_, 128>(&value)?;
         let versioning = if self.versioning {
             Version::Draft
         } else {
             Version::NonVersioned
         };
-        let record = Record {
+        let meta = RecordMeta {
             key,
-            iteration: 0,
-            data_iteration: 0,
             version: versioning,
             modified_by: self.username.clone(),
             modified: Utc::now(),
@@ -375,7 +372,12 @@ where
             rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
             evolution: <V as TreeRoot>::evolution(),
-            data: Some(value),
+        };
+        let record = Record {
+            meta_iteration: 0,
+            meta,
+            data_iteration: 0,
+            data,
         };
         let record = to_bytes::<_, 128>(&record)?;
         self.data.insert(&key_bytes, &*record)?;
@@ -405,7 +407,7 @@ where
                 )));
             };
             let previous_record = unsafe { archived_root::<Record>(&previous_record) };
-            if matches!(previous_record.version, ArchivedVersion::Draft) {
+            if matches!(previous_record.meta.version, ArchivedVersion::Draft) {
                 return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
             }
             self.latest_revision_index.remove(previous)?;
@@ -414,33 +416,37 @@ where
         if let Some(replacing) = self.data.get(&key_bytes)? {
             let replacing = unsafe { archived_root::<Record>(&replacing) };
             if self.versioning {
-                if matches!(replacing.version, ArchivedVersion::Released(_)) {
+                if matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
                     return Err(Error::VersioningMismatch(format!(
                         "Cannot replace Released record {key:?}"
                     )));
                 }
             }
-            let value = to_bytes::<_, 128>(&value)?;
+            let data = to_bytes::<_, 128>(&value)?;
             let versioning = if self.versioning {
                 Version::Draft
             } else {
                 Version::NonVersioned
             };
-            let record = Record {
+            let meta = RecordMeta {
                 key: generic_key,
-                iteration: replacing.iteration,
-                data_iteration: replacing.data_iteration + 1,
                 version: versioning,
                 modified_by: self.username.clone(),
                 modified: Utc::now(),
                 created: replacing
+                    .meta
                     .created
                     .deserialize(&mut rkyv::Infallible)
                     .unwrap(),
                 rust_version: SimpleVersion::rust_version(),
                 rkyv_version: SimpleVersion::rkyv_version(),
                 evolution: <V as TreeRoot>::evolution(),
-                data: Some(value),
+            };
+            let record = Record {
+                meta_iteration: replacing.meta_iteration,
+                meta,
+                data_iteration: replacing.data_iteration + 1,
+                data,
             };
             let record = to_bytes::<_, 128>(&record)?;
             self.data.insert(&key_bytes, &*record)?;
@@ -459,14 +465,9 @@ where
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };
 
-                match &archived_record.data {
-                    ArchivedOption::Some(data) => {
-                        let archived_data = check_archived_root::<V>(data)?;
-                        let deserialized: V = archived_data.deserialize(&mut rkyv::Infallible)?;
-                        Ok(Some(deserialized))
-                    }
-                    ArchivedOption::None => Ok(None),
-                }
+                let archived_data = check_archived_root::<V>(&archived_record.data)?;
+                let deserialized: V = archived_data.deserialize(&mut rkyv::Infallible)?;
+                Ok(Some(deserialized))
             }
             None => Ok(None),
         }
@@ -481,13 +482,8 @@ where
         match value {
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };
-                match &archived_record.data {
-                    ArchivedOption::Some(data) => {
-                        let archived_data = check_archived_root::<V>(data)?;
-                        Ok(f(Some(archived_data)))
-                    }
-                    ArchivedOption::None => Ok(f(None)),
-                }
+                let archived_data = check_archived_root::<V>(&archived_record.data)?;
+                Ok(f(Some(archived_data)))
             }
             None => Ok(f(None)),
         }

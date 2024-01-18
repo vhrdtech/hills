@@ -12,24 +12,35 @@ use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
 /// Tree record holding meta information, dates and data itself.
 #[derive(Archive, Serialize, Deserialize)]
-// #[archive(check_bytes)]
+// #[archive(check_bytes)] DateTime prevents deriving this
 // #[archive_attr(derive(Debug))]
 pub struct Record {
-    /// Same ID as in key
-    pub key: GenericKey,
-
-    /// 0 when first created, must be incremented each time any field of a Record is modified.
+    /// 0 when first created, must be incremented each time any field of a RecordMeta is modified.
     /// Used in synchronisation to determine which Record is newer.
     /// DateTime is not used to avoid dealing with incorrect clock on nodes.
-    pub iteration: u32,
+    pub meta_iteration: u32,
+    pub meta: RecordMeta,
+
+    /// 0 when first created, must be incremented each time data is changed.
     pub data_iteration: u32,
+    /// None when only id was created, but no data has been written yet.
+    pub data: AlignedVec,
+}
+
+#[derive(Archive, Serialize, Deserialize)]
+pub struct RecordMeta {
+    /// Same ID as in a Record's key
+    pub key: GenericKey,
 
     /// Versioning information for this record.
     /// All records in a tree are either NonVersioned or in Draft/Released(n) state.
     pub version: Version,
 
+    /// Username
     pub modified_by: String,
+    /// Last time meta or data were changed.
     pub modified: DateTime<Utc>,
+    /// Time when Record was created.
     pub created: DateTime<Utc>,
     // Additional metadata accessible by user.
     // pub meta: Option<AlignedVec>,
@@ -39,9 +50,6 @@ pub struct Record {
     pub rkyv_version: SimpleVersion,
     /// User program version used to serialize the data.
     pub evolution: SimpleVersion,
-
-    /// None when only id was created, but no data has been written yet.
-    pub data: Option<AlignedVec>,
 }
 
 /// Record state
@@ -49,8 +57,9 @@ pub struct Record {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub enum Version {
-    NonVersioned,
     /// Record can be edited many times, only latest data is kept and synchronised between nodes
+    NonVersioned,
+    /// Version controlled Record, not yet released and can be modified multiple times. Next revision cannot be created.
     Draft,
     /// Record is released and it's data cannot be changed.
     /// u32 can be used for other user states (Approved, Obsolete, etc), that can be changed.
