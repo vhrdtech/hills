@@ -137,23 +137,6 @@ impl VhrdDb {
         })
     }
 
-    // pub fn create_record(&mut self, tree_name: impl AsRef<str>) -> Result<RecordId, Error> {
-    //     let descriptor = self.descriptors.get(tree_name.as_ref().as_bytes())?;
-    //     let Some(descriptor) = descriptor else {
-    //         return Err(Error::TreeNotFound(tree_name.as_ref().to_string()));
-    //     };
-    //     let descriptor = check_archived_root::<TreeDescriptor>(&descriptor)
-    //         .map_err(|_| Error::RkyvCheckArchivedRoot)?;
-    //     trace!("{descriptor:?}");
-    //
-    //     // match self.node_kind {
-    //     //     NodeKind::Server | NodeKind::StandAlone => {}
-    //     //     NodeKind::Client => {}
-    //     //     NodeKind::Backup => {}
-    //     // }
-    //     todo!()
-    // }
-
     pub fn open_tree<K, V>(
         &mut self,
         tree_name: impl AsRef<str>,
@@ -252,9 +235,6 @@ impl VhrdDb {
                             ));
                         }
                         let descriptor = TreeDescriptor {
-                            next_temporary_id: 0,
-                            next_global_id: None,
-                            description: "".to_string(),
                             evolutions: [(evolution, current_tc)].into(),
                             versioning,
                         };
@@ -300,7 +280,13 @@ where
         self.data
             .transaction(|tx_db| match tx_db.get(b"_key_pool")? {
                 Some(key_pool) => {
-                    let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+                    // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                        .map_err(|e| {
+                            ConflictableTransactionError::Abort(format!(
+                                "check_archived_root: {e:?}"
+                            ))
+                        })?;
                     let mut key_pool: KeyPool =
                         key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
                             ConflictableTransactionError::Abort(
@@ -325,7 +311,8 @@ where
 
     pub fn key_pool_stats(&self) -> Result<u32, Error> {
         if let Some(key_pool) = self.data.get(b"_key_pool")? {
-            let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+            // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+            let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)?;
             let key_pool: KeyPool = key_pool.deserialize(&mut rkyv::Infallible).unwrap();
             Ok(key_pool.total_keys_available())
         } else {
@@ -337,7 +324,11 @@ where
         self.data
             .transaction(|tx_db| match tx_db.get(b"_key_pool")? {
                 Some(key_pool) => {
-                    let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+                    // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                        .map_err(|_| {
+                            ConflictableTransactionError::Abort("checked_archived_root")
+                        })?;
                     let mut key_pool: KeyPool =
                         key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
                             ConflictableTransactionError::Abort("get_next_key: deserialize")
@@ -376,6 +367,7 @@ where
         let record = Record {
             key,
             iteration: 0,
+            data_iteration: 0,
             version: versioning,
             modified_by: self.username.clone(),
             modified: Utc::now(),
@@ -436,7 +428,8 @@ where
             };
             let record = Record {
                 key: generic_key,
-                iteration: replacing.iteration + 1,
+                iteration: replacing.iteration,
+                data_iteration: replacing.data_iteration + 1,
                 version: versioning,
                 modified_by: self.username.clone(),
                 modified: Utc::now(),

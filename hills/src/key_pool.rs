@@ -2,13 +2,18 @@ use rkyv::{Archive, Deserialize, Serialize};
 use std::ops::Range;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct KeyPool {
     ranges: Vec<Range<u32>>,
+    _dummy22: [u8; 6],
 }
 
 impl KeyPool {
     pub fn new(ranges: Vec<Range<u32>>) -> Self {
-        KeyPool { ranges }
+        KeyPool {
+            ranges,
+            _dummy22: [0u8; 6],
+        }
     }
 
     pub fn push(&mut self, additional_range: Range<u32>) {

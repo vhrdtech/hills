@@ -22,6 +22,7 @@ pub struct Record {
     /// Used in synchronisation to determine which Record is newer.
     /// DateTime is not used to avoid dealing with incorrect clock on nodes.
     pub iteration: u32,
+    pub data_iteration: u32,
 
     /// Versioning information for this record.
     /// All records in a tree are either NonVersioned or in Draft/Released(n) state.

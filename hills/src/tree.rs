@@ -7,12 +7,9 @@ use std::collections::HashMap;
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct TreeDescriptor {
-    pub next_temporary_id: u32,
-    pub next_global_id: Option<u32>,
-
-    pub description: String,
     /// Type definition for each evolution still supported.
     /// Checked when opening a tree.
     pub evolutions: HashMap<SimpleVersion, TypeCollection>,
+    /// Whether Record's created in a tree will be NonVersioned or Draft
     pub versioning: bool,
 }
