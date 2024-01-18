@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 pub trait TreeKey {
     fn tree_name() -> &'static str;
-    fn new(key: GenericKey) -> Self;
+    fn from_generic(key: GenericKey) -> Self;
     fn to_generic(&self) -> GenericKey;
 }
 

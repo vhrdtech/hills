@@ -2,8 +2,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 use std::ops::Range;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
-#[archive(check_bytes)]
-// #[archive_attr(derive(Debug))]
 pub struct KeyPool {
     ranges: Vec<Range<u32>>,
 }
@@ -29,6 +27,10 @@ impl KeyPool {
             }
             Some(next_key)
         }
+    }
+
+    pub fn total_keys_available(&self) -> u32 {
+        self.ranges.iter().fold(0, |acc, r| acc + r.end - r.start)
     }
 }
 
