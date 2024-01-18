@@ -16,14 +16,13 @@ use rkyv::{
     archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Serialize,
 };
 use sled::transaction::{ConflictableTransactionError, TransactionError};
-use sled::{Db, IVec, Tree};
+use sled::{Db, Tree};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 pub struct VhrdDb {
@@ -37,8 +36,6 @@ pub struct VhrdDb {
 struct RawTreeBundle {
     /// Key -> Record tree
     data: Tree,
-    /// Monotonic serial -> JournalEntry
-    journal: Tree,
     /// All latest revisions -> ()
     latest_revision_index: Tree,
     versioning: bool,
@@ -48,8 +45,6 @@ struct RawTreeBundle {
 pub struct TreeBundle<K, V> {
     /// Key -> Record tree
     data: Tree,
-    /// Monotonic serial -> JournalEntry
-    journal: Tree,
     /// Monotonic index -> Key for all the latest revisions
     latest_revision_index: Tree,
 
@@ -189,7 +184,6 @@ impl VhrdDb {
         match self.open_trees.get(tree_name) {
             Some(raw_tree) => Ok(TreeBundle {
                 data: raw_tree.data.clone(),
-                journal: raw_tree.journal.clone(),
                 latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
                 versioning: raw_tree.versioning,
@@ -270,16 +264,12 @@ impl VhrdDb {
                     }
                 }
                 let data = self.db.open_tree(tree_name.as_bytes())?;
-                let journal = self
-                    .db
-                    .open_tree(format!("{tree_name}_journal").as_bytes())?;
                 let latest_revision_index = self
                     .db
                     .open_tree(format!("{tree_name}_latest_revision_index").as_bytes())?;
 
                 let bundle = RawTreeBundle {
                     data,
-                    journal,
                     latest_revision_index,
                     versioning,
                 };
@@ -287,7 +277,6 @@ impl VhrdDb {
                     .insert(tree_name.to_string(), bundle.clone());
                 Ok(TreeBundle {
                     data: bundle.data,
-                    journal: bundle.journal,
                     latest_revision_index: bundle.latest_revision_index,
                     username: username.as_ref().to_string(),
                     versioning,
@@ -386,11 +375,11 @@ where
         };
         let record = Record {
             key,
+            iteration: 0,
             version: versioning,
-            last_edited_by: self.username.clone(),
+            modified_by: self.username.clone(),
             modified: Utc::now(),
             created: Utc::now(),
-            meta: None,
             rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
             evolution: <V as TreeRoot>::evolution(),
@@ -411,62 +400,64 @@ where
                 "update {key:?}, on un-versioned tree"
             )));
         }
+        if let Some(previous) = generic_key.previous_revision() {
+            let previous = &to_bytes::<_, 0>(&previous)?;
+            if !self.latest_revision_index.contains_key(previous)? {
+                return Err(Error::VersioningMismatch(format!(
+                    "Cannot insert next revision without previous {key:?}"
+                )));
+            }
+            let Some(previous_record) = self.data.get(&previous)? else {
+                return Err(Error::Internal(format!(
+                    "Previous version of {key:?} is not in the data tree"
+                )));
+            };
+            let previous_record = unsafe { archived_root::<Record>(&previous_record) };
+            if matches!(previous_record.version, ArchivedVersion::Draft) {
+                return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
+            }
+            self.latest_revision_index.remove(previous)?;
+        }
+
         if let Some(replacing) = self.data.get(&key_bytes)? {
+            let replacing = unsafe { archived_root::<Record>(&replacing) };
             if self.versioning {
-                let replacing = unsafe { archived_root::<Record>(&replacing) };
                 if matches!(replacing.version, ArchivedVersion::Released(_)) {
                     return Err(Error::VersioningMismatch(format!(
                         "Cannot replace Released record {key:?}"
                     )));
                 }
             }
+            let value = to_bytes::<_, 128>(&value)?;
+            let versioning = if self.versioning {
+                Version::Draft
+            } else {
+                Version::NonVersioned
+            };
+            let record = Record {
+                key: generic_key,
+                iteration: replacing.iteration + 1,
+                version: versioning,
+                modified_by: self.username.clone(),
+                modified: Utc::now(),
+                created: replacing
+                    .created
+                    .deserialize(&mut rkyv::Infallible)
+                    .unwrap(),
+                rust_version: SimpleVersion::rust_version(),
+                rkyv_version: SimpleVersion::rkyv_version(),
+                evolution: <V as TreeRoot>::evolution(),
+                data: Some(value),
+            };
+            let record = to_bytes::<_, 128>(&record)?;
+            self.data.insert(&key_bytes, &*record)?;
+            self.latest_revision_index.insert(&key_bytes, &[])?;
+            Ok(K::from_generic(generic_key))
         } else {
-            return Err(Error::Usage(format!(
+            Err(Error::Usage(format!(
                 "update {key:?}, not found, create record first"
-            )));
+            )))
         }
-        if self.versioning {
-            if let Some(previous) = generic_key.previous_revision() {
-                let previous = &to_bytes::<_, 0>(&previous)?;
-                if !self.latest_revision_index.contains_key(previous)? {
-                    return Err(Error::VersioningMismatch(format!(
-                        "Cannot insert next revision without previous {key:?}"
-                    )));
-                }
-                let Some(previous_record) = self.data.get(&previous)? else {
-                    return Err(Error::Internal(format!(
-                        "Previous version of {key:?} is not in the data tree"
-                    )));
-                };
-                let previous_record = unsafe { archived_root::<Record>(&previous_record) };
-                if matches!(previous_record.version, ArchivedVersion::Draft) {
-                    return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
-                }
-                self.latest_revision_index.remove(previous)?;
-            }
-        }
-        let value = to_bytes::<_, 128>(&value)?;
-        let versioning = if self.versioning {
-            Version::Draft
-        } else {
-            Version::NonVersioned
-        };
-        let record = Record {
-            key: generic_key,
-            version: versioning,
-            last_edited_by: self.username.clone(),
-            modified: Utc::now(),
-            created: Utc::now(),
-            meta: None,
-            rust_version: SimpleVersion::rust_version(),
-            rkyv_version: SimpleVersion::rkyv_version(),
-            evolution: <V as TreeRoot>::evolution(),
-            data: Some(value),
-        };
-        let record = to_bytes::<_, 128>(&record)?;
-        self.data.insert(&key_bytes, &*record)?;
-        self.latest_revision_index.insert(&key_bytes, &[])?;
-        Ok(K::from_generic(generic_key))
     }
 
     pub fn get(&self, key: K) -> Result<Option<V>, Error> {
