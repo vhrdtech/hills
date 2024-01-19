@@ -1,11 +1,14 @@
+use crate::db_sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbSyncHandle};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
-use crate::sync::NodeKind;
+use crate::sync::{ChangeKind, RecordHotChange};
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
+use crate::{VhrdDbCmdTx, VhrdDbTelem};
 use chrono::Utc;
 use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
+use postage::prelude::Sink;
 use rkyv::ser::serializers::{
     AllocScratchError, AllocSerializer, CompositeSerializerError, SharedSerializeMapError,
 };
@@ -16,19 +19,25 @@ use rkyv::{
 };
 use sled::transaction::{ConflictableTransactionError, TransactionError};
 use sled::{Db, Tree};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::net::IpAddr;
 use std::ops::Range;
 use std::path::Path;
 use thiserror::Error;
+use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
-pub struct VhrdDb {
+pub struct VhrdDbClient {
     db: Db,
-    node_kind: NodeKind,
     descriptors: Tree,
     open_trees: HashMap<String, RawTreeBundle>,
+    event_tx: postage::mpsc::Sender<RecordHotChange>,
+    cmd_tx: VhrdDbCmdTx,
+    pub telem: VhrdDbTelem,
 }
 
 #[derive(Clone)]
@@ -47,9 +56,12 @@ pub struct TreeBundle<K, V> {
     /// Monotonic index -> Key for all the latest revisions
     latest_revision_index: Tree,
 
+    tree_name: String,
     username: String,
     versioning: bool,
-    // id_pool: Range<u32>,
+
+    event_tx: postage::mpsc::Sender<RecordHotChange>,
+
     _phantom_k: PhantomData<K>,
     _phantom_v: PhantomData<V>,
 }
@@ -91,6 +103,9 @@ pub enum Error {
 
     #[error("Pool of available keys depleted")]
     OutOfKeys,
+
+    #[error("Mpsc send failed")]
+    Mpsc,
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -124,16 +139,30 @@ impl<T: Debug> From<TransactionError<T>> for Error {
     }
 }
 
-impl VhrdDb {
-    pub fn open<P: AsRef<Path>>(path: P, node_kind: NodeKind) -> Result<Self, Error> {
+impl VhrdDbClient {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        rt: &Runtime,
+    ) -> Result<(VhrdDbClient, JoinHandle<()>), Error> {
+        #[cfg(not(test))]
         let db = sled::open(path)?;
+        #[cfg(test)]
+        let db = sled::Config::new().temporary(true).path(path).open()?;
         let descriptors = db.open_tree("descriptors")?;
-        Ok(VhrdDb {
-            db,
-            node_kind,
-            descriptors,
-            open_trees: HashMap::default(),
-        })
+        let (tx, rx) = postage::mpsc::channel(64);
+        let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
+        let (cmd_tx, telem, syncer_join) = sync_handle.start(rt);
+        Ok((
+            VhrdDbClient {
+                db,
+                descriptors,
+                open_trees: HashMap::default(),
+                event_tx: tx,
+                cmd_tx,
+                telem,
+            },
+            syncer_join,
+        ))
     }
 
     pub fn open_tree<K, V>(
@@ -169,6 +198,9 @@ impl VhrdDb {
                 latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
                 versioning: raw_tree.versioning,
+                tree_name: tree_name.to_string(),
+                event_tx: self.event_tx.clone(),
+
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
             }),
@@ -198,31 +230,35 @@ impl VhrdDb {
                         //     return Err(Error::EvolutionMismatch("Code evolution is older than database already have".into()));
                         // }
                         // TODO: register new evolution
-                        if evolution > max_evolution {
-                            info!("Will need to evolve {} to {}", max_evolution, evolution);
-                            let mut descriptor: TreeDescriptor =
-                                descriptor.deserialize(&mut rkyv::Infallible)?;
-                            descriptor.evolutions.insert(evolution, current_tc);
-                        } else if evolution < max_evolution {
-                            trace!(
-                                "Opening in backwards compatible mode, code is {}",
-                                evolution
-                            );
-                        } else {
-                            match descriptor.evolutions.get(&evolution.as_archived()) {
-                                Some(known_evolution) => {
-                                    let known_tc: TypeCollection =
-                                        known_evolution.deserialize(&mut rkyv::Infallible)?;
-                                    if current_tc != known_tc {
-                                        return Err(Error::EvolutionMismatch("Type definitions changed compared to what's in the database".into()));
+                        match evolution.cmp(&max_evolution) {
+                            Ordering::Less => {
+                                trace!(
+                                    "Opening in backwards compatible mode, code is {}",
+                                    evolution
+                                );
+                            }
+                            Ordering::Equal => {
+                                match descriptor.evolutions.get(&evolution.as_archived()) {
+                                    Some(known_evolution) => {
+                                        let known_tc: TypeCollection =
+                                            known_evolution.deserialize(&mut rkyv::Infallible)?;
+                                        if current_tc != known_tc {
+                                            return Err(Error::EvolutionMismatch("Type definitions changed compared to what's in the database".into()));
+                                        }
+                                        trace!("Type definitions matches exactly");
                                     }
-                                    trace!("Type definitions matches exactly");
-                                }
-                                None => {
-                                    warn!(
+                                    None => {
+                                        warn!(
                                         "Didn't found {evolution} in the database tree descriptor"
                                     );
+                                    }
                                 }
+                            }
+                            Ordering::Greater => {
+                                info!("Will need to evolve {} to {}", max_evolution, evolution);
+                                let mut descriptor: TreeDescriptor =
+                                    descriptor.deserialize(&mut rkyv::Infallible)?;
+                                descriptor.evolutions.insert(evolution, current_tc);
                             }
                         }
                     }
@@ -259,10 +295,35 @@ impl VhrdDb {
                     latest_revision_index: bundle.latest_revision_index,
                     username: username.as_ref().to_string(),
                     versioning,
+                    tree_name: tree_name.to_string(),
+                    event_tx: self.event_tx.clone(),
+
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
                 })
             }
+        }
+    }
+
+    pub fn connect(&mut self, ip_addr: IpAddr, port: u16) {
+        let r = self
+            .cmd_tx
+            .blocking_send(SyncClientCommand::Connect(ip_addr, port));
+        if r.is_err() {
+            warn!("db: connect: send failed");
+        }
+    }
+
+    pub fn disconnect(&mut self) {
+        let r = self.cmd_tx.blocking_send(SyncClientCommand::Disconnect);
+        if r.is_err() {
+            warn!("db: disconnect: send failed");
+        }
+    }
+
+    pub fn telemetry<F: FnMut(&SyncClientTelemetry)>(&self, mut f: F) {
+        if let Ok(telem) = self.telem.read() {
+            f(&telem);
         }
     }
 }
@@ -382,6 +443,16 @@ where
         let record = to_bytes::<_, 128>(&record)?;
         self.data.insert(&key_bytes, &*record)?;
         self.latest_revision_index.insert(&key_bytes, &[])?;
+
+        let change = RecordHotChange {
+            tree: self.tree_name.clone(),
+            key,
+            kind: ChangeKind::Create,
+        };
+        self.event_tx
+            .blocking_send(change)
+            .map_err(|_| Error::Mpsc)?;
+
         Ok(K::from_generic(key))
     }
 
@@ -451,6 +522,16 @@ where
             let record = to_bytes::<_, 128>(&record)?;
             self.data.insert(&key_bytes, &*record)?;
             self.latest_revision_index.insert(&key_bytes, &[])?;
+
+            let change = RecordHotChange {
+                tree: self.tree_name.clone(),
+                key: generic_key,
+                kind: ChangeKind::ModifyData,
+            };
+            self.event_tx
+                .blocking_send(change)
+                .map_err(|_| Error::Mpsc)?;
+
             Ok(K::from_generic(generic_key))
         } else {
             Err(Error::Usage(format!(

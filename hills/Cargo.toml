@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 sled = "0.34"
 rkyv = { workspace = true }
+postage = "0.5"
+tokio = { version = "1.35", default-features = false, features = ["macros", "io-std", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
 chrono = { version = "0.4", features = ["rkyv"] }
 thiserror = "1.0"
 log = "0.4"
