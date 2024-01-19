@@ -15,6 +15,8 @@ use std::ops::Range;
 // }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct RecordHotChange {
     pub tree: String,
     pub key: GenericKey,
@@ -22,6 +24,8 @@ pub struct RecordHotChange {
 }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub enum ChangeKind {
     Create,
     ModifyMeta,
@@ -30,10 +34,11 @@ pub enum ChangeKind {
 }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub enum ClientEvent {
     PresentSelf {
         uuid: [u8; 16],
-        username: String,
     },
     Subscribe {
         trees: Vec<String>,
@@ -67,10 +72,11 @@ pub enum ClientEvent {
 }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub enum ServerEvent {
     PresentSelf {
         uuid: [u8; 16],
-        username: String,
     },
 
     GetTreeOverview {
@@ -102,6 +108,8 @@ pub enum ServerEvent {
 }
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
+#[archive(check_bytes)]
+#[archive_attr(derive(Debug))]
 pub struct RecordIteration {
     meta_iteration: u32,
     data_iteration: u32,

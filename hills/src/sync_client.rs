@@ -1,16 +1,18 @@
-use crate::sync::RecordHotChange;
+use crate::sync::{ClientEvent, RecordHotChange};
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    StreamExt,
+    Sink, SinkExt, StreamExt,
 };
 use log::{info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
+use rkyv::to_bytes;
 use sled::Db;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message;
 
 pub struct VhrdDbSyncHandle {
     db: Db,
@@ -65,55 +67,68 @@ async fn event_loop(
     let mut to_replay = Vec::new();
 
     loop {
-        match &ws_txrx {
-            None => {
-                tokio::select! {
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(cmd) => match cmd {
-                                SyncClientCommand::Connect(ip_addr, port) => {
-                                    let url = format!("ws://{ip_addr}:{port}");
-                                    info!("ws: Connecting to remote {url}");
-                                    let ws_stream = match tokio_tungstenite::connect_async(url).await {
-                                        Ok((ws_stream, _)) => {
-                                            if let Ok(mut telem) = telem.write() {
-                                                telem.connected = true;
-                                                telem.error_message.clear();
-                                            }
-                                            ws_stream
-                                        },
-                                        Err(e) => {
-                                            warn!("{e:?}");
-                                            if let Ok(mut telem) = telem.write() {
-                                                telem.connected = false;
-                                                telem.error_message = format!("{e:?}");
-                                            }
-                                            continue;
-                                        }
-                                    };
-                                    let (ws_tx, ws_rx) = ws_stream.split();
-                                    ws_txrx = Some((ws_tx, ws_rx));
+        if let Some((ws_tx, ws_rx)) = &mut ws_txrx {
+        } else {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        info!("Sync client: tx end no longer exist, exiting");
+                        break;
+                    };
+                    match cmd {
+                        SyncClientCommand::Connect(ip_addr, port) => {
+                            let url = format!("ws://{ip_addr}:{port}");
+                            info!("ws: Connecting to remote {url}");
+                            let ws_stream = match tokio_tungstenite::connect_async(url).await {
+                                Ok((ws_stream, _)) => {
+                                    if let Ok(mut telem) = telem.write() {
+                                        telem.connected = true;
+                                        telem.error_message.clear();
+                                    }
+                                    ws_stream
+                                },
+                                Err(e) => {
+                                    warn!("{e:?}");
+                                    if let Ok(mut telem) = telem.write() {
+                                        telem.connected = false;
+                                        telem.error_message = format!("{e:?}");
+                                    }
+                                    continue;
                                 }
-                                SyncClientCommand::Disconnect => {}
-                            }
-                            None => {
-                                info!("Sync client: tx end no longer exist, exiting");
-                                break;
-                            }
+                            };
+                            let (mut ws_tx, ws_rx) = ws_stream.split();
+                            present_self(&db, &mut ws_tx).await;
+                            ws_txrx = Some((ws_tx, ws_rx));
                         }
+                        SyncClientCommand::Disconnect => {}
                     }
-                    event = event_rx.recv() => {
-                        trace!("ev: {event:?}");
-                        if let Some(event) = event {
-                            to_replay.push(event);
-                            if let Ok(mut telem) = telem.write() {
-                                telem.backlog = to_replay.len();
-                            }
+                }
+                event = event_rx.recv() => {
+                    trace!("ev: {event:?}");
+                    if let Some(event) = event {
+                        to_replay.push(event);
+                        if let Ok(mut telem) = telem.write() {
+                            telem.backlog = to_replay.len();
                         }
                     }
                 }
             }
-            Some((ws_tx, ws_rx)) => {}
         }
     }
+}
+
+async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) {
+    let Some(uuid_bytes) = db.get(b"self_uuid").unwrap() else {
+        return;
+    };
+    if uuid_bytes.len() != 16 {
+        return;
+    }
+    let mut uuid = [0u8; 16];
+    uuid[..].copy_from_slice(&uuid_bytes);
+    let id_event = ClientEvent::PresentSelf { uuid };
+    let id_event = to_bytes::<_, 8>(&id_event).unwrap();
+    tx.feed(Message::Binary(id_event.to_vec())).await;
+
+    tx.flush().await;
 }
