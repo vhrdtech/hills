@@ -1,11 +1,11 @@
-pub mod db_client;
-mod db_sync_client;
+pub mod db;
 mod journal;
 mod key_pool;
 pub mod record;
 mod sync;
+mod sync_client;
 mod sync_server;
 pub mod tree;
 
-pub use db_client::{TreeBundle, VhrdDbClient};
-pub use db_sync_client::{VhrdDbCmdTx, VhrdDbTelem};
+pub use db::{TreeBundle, VhrdDbClient};
+pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
