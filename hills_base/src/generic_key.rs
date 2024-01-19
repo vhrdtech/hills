@@ -6,9 +6,9 @@ pub trait TreeKey {
     fn to_generic(&self) -> GenericKey;
 }
 
-#[derive(Copy, Clone, Debug, Hash, Archive, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[archive_attr(derive(Debug, Hash, PartialEq, Eq))]
 pub struct GenericKey {
     pub id: u32,
     pub revision: u32,

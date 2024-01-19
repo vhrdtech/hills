@@ -4,6 +4,7 @@ mod journal;
 mod key_pool;
 pub mod record;
 mod sync;
+mod sync_server;
 pub mod tree;
 
 pub use db_client::{TreeBundle, VhrdDbClient};

@@ -1,5 +1,7 @@
 use hills_base::GenericKey;
+use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Range;
 
 // pub enum NodeKind {
 //     /// Node gives out mutable locks, accepts changes and serves data for other nodes.
@@ -12,27 +14,94 @@ use std::collections::HashMap;
 //     StandAlone,
 // }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
 pub struct RecordHotChange {
     pub tree: String,
     pub key: GenericKey,
     pub kind: ChangeKind,
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
 pub enum ChangeKind {
     Create,
     ModifyMeta,
-    ModifyData,
+    ModifyBoth,
     Remove,
 }
 
-#[derive(Debug)]
-pub struct TreeOverview {
-    records: HashMap<GenericKey, RecordIteration>,
+#[derive(Archive, Debug, Serialize, Deserialize)]
+pub enum ClientEvent {
+    PresentSelf {
+        uuid: [u8; 16],
+        username: String,
+    },
+    Subscribe {
+        trees: Vec<String>,
+    },
+
+    GetTreeOverview {
+        tree: String,
+    },
+    TreeOverview {
+        tree: String,
+        records: HashMap<GenericKey, RecordIteration>,
+    },
+    RecordChanged {
+        change: RecordHotChange,
+        meta: AlignedVec,
+        data: Option<AlignedVec>,
+    },
+
+    GetKeySet {
+        tree: String,
+    },
+
+    CheckOut {
+        tree: String,
+        keys: Vec<GenericKey>,
+    },
+    Return {
+        tree: String,
+        key: Vec<GenericKey>,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Archive, Debug, Serialize, Deserialize)]
+pub enum ServerEvent {
+    PresentSelf {
+        uuid: [u8; 16],
+        username: String,
+    },
+
+    GetTreeOverview {
+        tree: String,
+    },
+    TreeOverview {
+        tree: String,
+        records: HashMap<GenericKey, RecordIteration>,
+    },
+    RecordChanged {
+        change: RecordHotChange,
+        meta: AlignedVec,
+        data: Option<AlignedVec>,
+    },
+
+    KeySet {
+        keys: Range<u32>,
+    },
+
+    CheckedOut {
+        tree: String,
+        keys: Vec<GenericKey>,
+    },
+    AlreadyCheckedOut {
+        tree: String,
+        keys: Vec<GenericKey>,
+        by_node: [u8; 16],
+    },
+}
+
+#[derive(Archive, Debug, Serialize, Deserialize)]
 pub struct RecordIteration {
     meta_iteration: u32,
     data_iteration: u32,
