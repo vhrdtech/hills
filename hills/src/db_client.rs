@@ -30,9 +30,11 @@ use std::path::Path;
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 pub struct VhrdDbClient {
     db: Db,
+    self_uuid: Uuid,
     descriptors: Tree,
     open_trees: HashMap<String, RawTreeBundle>,
     event_tx: postage::mpsc::Sender<RecordHotChange>,
@@ -57,6 +59,7 @@ pub struct TreeBundle<K, V> {
     latest_revision_index: Tree,
 
     tree_name: String,
+    uuid: Uuid,
     username: String,
     versioning: bool,
 
@@ -149,12 +152,32 @@ impl VhrdDbClient {
         #[cfg(test)]
         let db = sled::Config::new().temporary(true).path(path).open()?;
         let descriptors = db.open_tree("descriptors")?;
+
+        let self_uuid = match db.get(b"self_uuid")? {
+            Some(uuid_bytes) => {
+                if uuid_bytes.len() != 16 {
+                    return Err(Error::Internal("Invalid self_uuid".into()));
+                }
+                let mut uuid = [0u8; 16];
+                uuid[..].copy_from_slice(&uuid_bytes);
+                Uuid::from_bytes(uuid)
+            }
+            None => {
+                let uuid = Uuid::new_v4();
+                trace!("Created new db, uuid={uuid}");
+                let uuid_bytes = uuid.into_bytes();
+                db.insert(b"node_id", &uuid_bytes)?;
+                uuid
+            }
+        };
+
         let (tx, rx) = postage::mpsc::channel(64);
         let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
         let (cmd_tx, telem, syncer_join) = sync_handle.start(rt);
         Ok((
             VhrdDbClient {
                 db,
+                self_uuid,
                 descriptors,
                 open_trees: HashMap::default(),
                 event_tx: tx,
@@ -200,6 +223,7 @@ impl VhrdDbClient {
                 versioning: raw_tree.versioning,
                 tree_name: tree_name.to_string(),
                 event_tx: self.event_tx.clone(),
+                uuid: self.self_uuid,
 
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
@@ -297,6 +321,7 @@ impl VhrdDbClient {
                     versioning,
                     tree_name: tree_name.to_string(),
                     event_tx: self.event_tx.clone(),
+                    uuid: self.self_uuid,
 
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
@@ -427,6 +452,7 @@ where
         let meta = RecordMeta {
             key,
             version: versioning,
+            modified_on: self.uuid.clone().into_bytes(),
             modified_by: self.username.clone(),
             modified: Utc::now(),
             created: Utc::now(),
@@ -502,6 +528,7 @@ where
             let meta = RecordMeta {
                 key: generic_key,
                 version: versioning,
+                modified_on: self.uuid.clone().into_bytes(),
                 modified_by: self.username.clone(),
                 modified: Utc::now(),
                 created: replacing
@@ -526,7 +553,7 @@ where
             let change = RecordHotChange {
                 tree: self.tree_name.clone(),
                 key: generic_key,
-                kind: ChangeKind::ModifyData,
+                kind: ChangeKind::ModifyBoth,
             };
             self.event_tx
                 .blocking_send(change)

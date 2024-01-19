@@ -38,6 +38,8 @@ pub struct RecordMeta {
 
     /// Username
     pub modified_by: String,
+    /// Node UUID
+    pub modified_on: [u8; 16],
     /// Last time meta or data were changed.
     pub modified: DateTime<Utc>,
     /// Time when Record was created.

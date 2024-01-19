@@ -13,6 +13,7 @@ futures-util = "0.3"
 chrono = { version = "0.4", features = ["rkyv"] }
 thiserror = "1.0"
 log = "0.4"
+uuid = { version = "1.7.0", features = ["v4"] }
 
 hills_base = { path = "../hills_base" }
 hills_derive = { path = "../hills_derive" }
