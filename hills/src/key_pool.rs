@@ -1,4 +1,6 @@
-use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::{check_archived_root, to_bytes, Archive, Deserialize, Serialize};
+use sled::transaction::ConflictableTransactionError;
+use sled::Tree;
 use std::ops::Range;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
@@ -36,6 +38,44 @@ impl KeyPool {
 
     pub fn total_keys_available(&self) -> u32 {
         self.ranges.iter().fold(0, |acc, r| acc + r.end - r.start)
+    }
+
+    pub fn feed_for(tree: &Tree, additional_range: Range<u32>) -> Result<(), String> {
+        let r = tree.transaction(|tx_db| match tx_db.get(b"_key_pool")? {
+            Some(key_pool) => {
+                let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                    .map_err(|_| ConflictableTransactionError::Abort("check_archived_root"))?;
+                let mut key_pool: KeyPool =
+                    key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
+                        ConflictableTransactionError::Abort("get_next_key: deserialize")
+                    })?;
+                key_pool.push(additional_range.clone());
+                let key_pool = to_bytes::<_, 8>(&key_pool)
+                    .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                tx_db.insert(b"_key_pool", &*key_pool)?;
+                Ok(())
+            }
+            None => {
+                let key_pool = KeyPool::new(vec![additional_range.clone()]);
+                let key_pool = to_bytes::<_, 8>(&key_pool)
+                    .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                tx_db.insert(b"_key_pool", &*key_pool)?;
+                Ok(())
+            }
+        });
+        r.map_err(|e| format!("{e:?}"))
+    }
+
+    pub fn stats_for(tree: &Tree) -> Result<u32, String> {
+        if let Some(key_pool) = tree.get(b"_key_pool").map_err(|e| format!("{e:?}"))? {
+            // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+            let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                .map_err(|_| "KeyPool: check_archived_root".to_string())?;
+            let key_pool: KeyPool = key_pool.deserialize(&mut rkyv::Infallible).unwrap();
+            Ok(key_pool.total_keys_available())
+        } else {
+            Ok(0)
+        }
     }
 }
 

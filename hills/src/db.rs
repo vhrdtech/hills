@@ -3,7 +3,7 @@ use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::{ChangeKind, RecordHotChange};
 use crate::sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbSyncHandle};
-use crate::sync_common::SELF_UUID;
+use crate::sync_common::{ManagedTrees, MANAGED_TREES, SELF_UUID};
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::{VhrdDbCmdTx, VhrdDbTelem};
 use chrono::Utc;
@@ -216,6 +216,27 @@ impl VhrdDbClient {
             ));
         }
 
+        match self.db.get(MANAGED_TREES)? {
+            Some(trees) => {
+                let trees = check_archived_root::<ManagedTrees>(&trees)?;
+                if !trees.trees.contains(tree_name) {
+                    let mut trees: ManagedTrees =
+                        trees.deserialize(&mut rkyv::Infallible).expect("");
+                    trees.trees.insert(tree_name.to_string());
+                    let trees_bytes = to_bytes::<_, 128>(&trees)?;
+                    self.db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
+                }
+            }
+            None => {
+                let trees = ManagedTrees {
+                    trees: [tree_name.to_string()].into(),
+                    _dummy22: [0u8; 18],
+                };
+                let trees_bytes = to_bytes::<_, 128>(&trees)?;
+                self.db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
+            }
+        }
+
         match self.open_trees.get(tree_name) {
             Some(raw_tree) => Ok(TreeBundle {
                 data: raw_tree.data.clone(),
@@ -363,47 +384,11 @@ where
 {
     // TODO: should not be pub
     pub fn feed_key_pool(&mut self, additional_range: Range<u32>) -> Result<(), Error> {
-        self.data
-            .transaction(|tx_db| match tx_db.get(b"_key_pool")? {
-                Some(key_pool) => {
-                    // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
-                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
-                        .map_err(|e| {
-                            ConflictableTransactionError::Abort(format!(
-                                "check_archived_root: {e:?}"
-                            ))
-                        })?;
-                    let mut key_pool: KeyPool =
-                        key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
-                            ConflictableTransactionError::Abort(
-                                "get_next_key: deserialize".to_string(),
-                            )
-                        })?;
-                    key_pool.push(additional_range.clone());
-                    let key_pool = to_bytes::<_, 8>(&key_pool)
-                        .map_err(|_| ConflictableTransactionError::Abort("to_bytes".to_string()))?;
-                    tx_db.insert(b"_key_pool", &*key_pool)?;
-                    Ok(Ok(()))
-                }
-                None => {
-                    let key_pool = KeyPool::new(vec![additional_range.clone()]);
-                    let key_pool = to_bytes::<_, 8>(&key_pool)
-                        .map_err(|_| ConflictableTransactionError::Abort("to_bytes".to_string()))?;
-                    tx_db.insert(b"_key_pool", &*key_pool)?;
-                    Ok(Ok(()))
-                }
-            })?
+        KeyPool::feed_for(&self.data, additional_range).map_err(Error::Internal)
     }
 
     pub fn key_pool_stats(&self) -> Result<u32, Error> {
-        if let Some(key_pool) = self.data.get(b"_key_pool")? {
-            // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
-            let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)?;
-            let key_pool: KeyPool = key_pool.deserialize(&mut rkyv::Infallible).unwrap();
-            Ok(key_pool.total_keys_available())
-        } else {
-            Err(Error::Usage("No key pool".to_string()))
-        }
+        KeyPool::stats_for(&self.data).map_err(Error::Internal)
     }
 
     fn get_next_key(&mut self) -> Result<u32, Error> {
@@ -439,9 +424,9 @@ where
     pub fn insert(&mut self, value: V) -> Result<K, Error> {
         let key = self.get_next_key()?;
         let key = GenericKey::new(key, 0);
-        let key_bytes = to_bytes::<_, 0>(&key)?;
+        let key_bytes = key.to_bytes();
 
-        if self.data.contains_key(&key_bytes)? {
+        if self.data.contains_key(key_bytes)? {
             return Err(Error::Internal("Duplicate key from KeyPool".to_string()));
         }
         let data = to_bytes::<_, 128>(&value)?;
@@ -453,7 +438,7 @@ where
         let meta = RecordMeta {
             key,
             version: versioning,
-            modified_on: self.uuid.clone().into_bytes(),
+            modified_on: self.uuid.into_bytes(),
             modified_by: self.username.clone(),
             modified: Utc::now(),
             created: Utc::now(),
@@ -475,6 +460,8 @@ where
             tree: self.tree_name.clone(),
             key,
             kind: ChangeKind::Create,
+            data_iteration: 0,
+            meta_iteration: 0,
         };
         self.event_tx
             .blocking_send(change)
@@ -485,7 +472,7 @@ where
 
     pub fn update(&mut self, key: K, value: V) -> Result<K, Error> {
         let generic_key = key.to_generic();
-        let key_bytes = to_bytes::<_, 0>(&generic_key)?;
+        let key_bytes = generic_key.to_bytes();
 
         if !self.versioning && generic_key.revision != 0 {
             return Err(Error::Usage(format!(
@@ -493,13 +480,13 @@ where
             )));
         }
         if let Some(previous) = generic_key.previous_revision() {
-            let previous = &to_bytes::<_, 0>(&previous)?;
+            let previous = previous.to_bytes();
             if !self.latest_revision_index.contains_key(previous)? {
                 return Err(Error::VersioningMismatch(format!(
                     "Cannot insert next revision without previous {key:?}"
                 )));
             }
-            let Some(previous_record) = self.data.get(&previous)? else {
+            let Some(previous_record) = self.data.get(previous)? else {
                 return Err(Error::Internal(format!(
                     "Previous version of {key:?} is not in the data tree"
                 )));
@@ -511,7 +498,7 @@ where
             self.latest_revision_index.remove(previous)?;
         }
 
-        if let Some(replacing) = self.data.get(&key_bytes)? {
+        if let Some(replacing) = self.data.get(key_bytes)? {
             let replacing = unsafe { archived_root::<Record>(&replacing) };
             if self.versioning {
                 if matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
@@ -529,7 +516,7 @@ where
             let meta = RecordMeta {
                 key: generic_key,
                 version: versioning,
-                modified_on: self.uuid.clone().into_bytes(),
+                modified_on: self.uuid.into_bytes(),
                 modified_by: self.username.clone(),
                 modified: Utc::now(),
                 created: replacing
@@ -542,18 +529,20 @@ where
                 evolution: <V as TreeRoot>::evolution(),
             };
             let record = Record {
-                meta_iteration: replacing.meta_iteration,
+                meta_iteration: replacing.meta_iteration + 1,
                 meta,
                 data_iteration: replacing.data_iteration + 1,
                 data,
             };
-            let record = to_bytes::<_, 128>(&record)?;
-            self.data.insert(&key_bytes, &*record)?;
+            let record_bytes = to_bytes::<_, 128>(&record)?;
+            self.data.insert(&key_bytes, &*record_bytes)?;
             self.latest_revision_index.insert(&key_bytes, &[])?;
 
             let change = RecordHotChange {
                 tree: self.tree_name.clone(),
                 key: generic_key,
+                meta_iteration: record.meta_iteration,
+                data_iteration: record.data_iteration,
                 kind: ChangeKind::ModifyBoth,
             };
             self.event_tx
@@ -569,7 +558,8 @@ where
     }
 
     pub fn get(&self, key: K) -> Result<Option<V>, Error> {
-        let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
+        let key_bytes = key.to_generic().to_bytes();
+        let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };
@@ -587,7 +577,8 @@ where
         key: K,
         mut f: F,
     ) -> Result<R, Error> {
-        let value = self.data.get(to_bytes::<_, 0>(&key.to_generic())?)?;
+        let key_bytes = key.to_generic().to_bytes();
+        let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };

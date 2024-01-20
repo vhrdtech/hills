@@ -21,6 +21,8 @@ use std::ops::Range;
 pub struct RecordHotChange {
     pub tree: String,
     pub key: GenericKey,
+    pub meta_iteration: u32,
+    pub data_iteration: u32,
     pub kind: ChangeKind,
 }
 
@@ -34,6 +36,7 @@ pub enum ChangeKind {
     Remove,
 }
 
+// TODO: Switch to serde with &[u8] support to avoid copying data buffer many times?
 #[derive(Archive, Serialize, Deserialize)]
 // #[archive(check_bytes)]
 // #[archive_attr(derive(Debug))]
@@ -52,10 +55,30 @@ pub enum Event {
         tree: String,
         records: HashMap<GenericKey, RecordIteration>,
     },
+
+    RecordCreated {
+        tree: String,
+        key: GenericKey,
+        meta: RecordMeta,
+        data: AlignedVec,
+    },
+    RecordMetaChanged {
+        tree: String,
+        key: GenericKey,
+        meta: RecordMeta,
+        meta_iteration: u32,
+    },
     RecordChanged {
-        change: RecordHotChange,
-        meta: Option<RecordMeta>,
-        data: Option<AlignedVec>,
+        tree: String,
+        key: GenericKey,
+        meta: RecordMeta,
+        meta_iteration: u32,
+        data: AlignedVec,
+        data_iteration: u32,
+    },
+    RecordRemoved {
+        tree: String,
+        key: GenericKey,
     },
 
     GetKeySet {

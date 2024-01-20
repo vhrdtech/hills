@@ -1,15 +1,16 @@
 use crate::handle_result;
+use crate::key_pool::KeyPool;
 use crate::sync::{ArchivedEvent, Event, RecordHotChange};
-use crate::sync_common::Error;
 use crate::sync_common::{present_self, send_hot_change};
+use crate::sync_common::{Error, ManagedTrees, MANAGED_TREES};
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    StreamExt, TryStreamExt,
+    Sink, SinkExt, StreamExt, TryStreamExt,
 };
 use log::{info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::archived_root;
+use rkyv::{archived_root, check_archived_root, to_bytes};
 use sled::Db;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -140,7 +141,10 @@ async fn event_loop(
                                 }
                             };
                             let (mut ws_tx, ws_rx) = ws_stream.split();
-                            present_self(&db, &mut ws_tx).await;
+                            let r = present_self(&db, &mut ws_tx).await;
+                            handle_result!(r);
+                            let r = request_keys(&db, &mut ws_tx).await;
+                            handle_result!(r);
                             ws_txrx = Some((ws_tx, ws_rx));
                         }
                         SyncClientCommand::Disconnect => {}
@@ -168,7 +172,7 @@ async fn event_loop(
     }
 }
 
-async fn process_message(ws_message: Message, _db: &mut Db) -> Result<(), Error> {
+async fn process_message(ws_message: Message, db: &mut Db) -> Result<(), Error> {
     match ws_message {
         Message::Binary(bytes) => {
             let ev = unsafe { archived_root::<Event>(&bytes) };
@@ -179,15 +183,23 @@ async fn process_message(ws_message: Message, _db: &mut Db) -> Result<(), Error>
                 ArchivedEvent::Subscribe { .. } => {}
                 ArchivedEvent::GetTreeOverview { .. } => {}
                 ArchivedEvent::TreeOverview { .. } => {}
-                ArchivedEvent::RecordChanged { .. } => {}
-                ArchivedEvent::GetKeySet { .. } => {}
                 ArchivedEvent::KeySet { tree, keys } => {
                     trace!("Got more keys for {tree} {keys:?}");
+                    let tree = db.open_tree(tree.as_str())?;
+                    let keys = keys.start..keys.end;
+                    KeyPool::feed_for(&tree, keys).map_err(Error::Internal)?;
                 }
-                ArchivedEvent::CheckOut { .. } => {}
-                ArchivedEvent::Return { .. } => {}
                 ArchivedEvent::CheckedOut { .. } => {}
                 ArchivedEvent::AlreadyCheckedOut { .. } => {}
+                ArchivedEvent::RecordCreated { .. } => {}
+                ArchivedEvent::RecordMetaChanged { .. } => {}
+                ArchivedEvent::RecordChanged { .. } => {}
+                ArchivedEvent::RecordRemoved { .. } => {}
+                ArchivedEvent::CheckOut { .. }
+                | ArchivedEvent::Return { .. }
+                | ArchivedEvent::GetKeySet { .. } => {
+                    warn!("Unsupported event from server");
+                }
             }
         }
         u => {
@@ -195,5 +207,29 @@ async fn process_message(ws_message: Message, _db: &mut Db) -> Result<(), Error>
         }
     }
 
+    Ok(())
+}
+
+pub async fn request_keys(db: &Db, ws_tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
+    if let Some(trees) = db.get(MANAGED_TREES)? {
+        let trees = check_archived_root::<ManagedTrees>(&trees)?;
+        let trees: Vec<String> = trees.trees.iter().map(|name| name.to_string()).collect();
+        for tree_name in &trees {
+            let tree = db.open_tree(tree_name.as_str())?;
+            let available_keys = KeyPool::stats_for(&tree).map_err(Error::Internal)?;
+            trace!("request_keys: {} available: {}", tree_name, available_keys);
+            if available_keys < 3 {
+                let ev = Event::GetKeySet {
+                    tree: tree_name.to_string(),
+                };
+                let ev_bytes = to_bytes::<_, 128>(&ev)?;
+                ws_tx
+                    .feed(Message::Binary(ev_bytes.to_vec()))
+                    .await
+                    .map_err(|_| Error::Ws)?;
+            }
+        }
+    }
+    ws_tx.flush().await.map_err(|_| Error::Ws)?;
     Ok(())
 }

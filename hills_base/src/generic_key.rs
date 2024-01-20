@@ -1,4 +1,5 @@
 use rkyv::{Archive, Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 
 pub trait TreeKey {
     fn tree_name() -> &'static str;
@@ -47,5 +48,11 @@ impl GenericKey {
         word.copy_from_slice(&bytes[4..=7]);
         let revision = u32::from_be_bytes(word);
         Some(GenericKey { id, revision })
+    }
+}
+
+impl Display for GenericKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.id, self.revision)
     }
 }
