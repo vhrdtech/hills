@@ -4,6 +4,7 @@ members = [
 	"hills",
 	"hills_base",
 	"hills_derive",
+	"hills_server"
 ]
 
 [workspace.dependencies]

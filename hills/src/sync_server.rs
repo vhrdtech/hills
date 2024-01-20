@@ -1,23 +1,19 @@
-use crate::sync::ClientEvent;
+use crate::handle_result;
+use crate::sync::{ArchivedEvent, Event};
+use crate::sync_common::{present_self, Error, SELF_UUID};
 use futures_util::{Sink, Stream, StreamExt, TryStreamExt};
 use log::{info, trace, warn};
-use rkyv::check_archived_root;
+use rkyv::archived_root;
 use sled::Db;
 use std::path::Path;
-use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 pub struct HillsServer {
     pub join: JoinHandle<()>,
-}
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error(transparent)]
-    Sled(#[from] sled::Error),
 }
 
 impl HillsServer {
@@ -26,6 +22,13 @@ impl HillsServer {
         let db = sled::open(path)?;
         #[cfg(test)]
         let db = sled::Config::new().temporary(true).path(path).open()?;
+
+        if !db.contains_key(SELF_UUID)? {
+            let uuid = Uuid::new_v4();
+            trace!("Created new server db, uuid={uuid}");
+            let uuid_bytes = uuid.into_bytes();
+            db.insert(SELF_UUID, &uuid_bytes)?;
+        }
 
         let join = rt.spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
@@ -62,22 +65,23 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
 }
 
 async fn ws_event_loop(
-    mut ws_sink: impl Sink<Message> + Unpin,
-    mut ws_source: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    mut ws_tx: impl Sink<Message> + Unpin,
+    mut ws_rx: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     mut db: Db,
 ) {
     info!("Event loop started");
-    // tokio::pin!(ws_sink);
-    // tokio::pin!(ws_source);
+    let r = present_self(&db, &mut ws_tx).await;
+    handle_result!(r);
     loop {
         tokio::select! {
-            frame = ws_source.try_next() => {
-                match frame {
-                    Ok(Some(frame)) => {
-                        let should_terminate = process_message(frame, &mut db).await;
-                        if should_terminate {
+            message = ws_rx.try_next() => {
+                match message {
+                    Ok(Some(message)) => {
+                        if let Message::Close(_) = &message {
                             break;
                         }
+                        let r = process_message(message, &mut db).await;
+                        handle_result!(r);
                     }
                     Ok(None) => {
                         break;
@@ -94,21 +98,34 @@ async fn ws_event_loop(
     info!("Event loop: exiting");
 }
 
-async fn process_message(ws_message: Message, _db: &mut Db) -> bool {
+async fn process_message(ws_message: Message, _db: &mut Db) -> Result<(), Error> {
     match ws_message {
         Message::Binary(bytes) => {
-            let client_event = check_archived_root::<ClientEvent>(&bytes).unwrap();
-            trace!("{client_event:?}");
-        }
-        Message::Close(_) => {
-            return true;
+            let client_event = unsafe { archived_root::<Event>(&bytes) };
+            match client_event {
+                ArchivedEvent::PresentSelf { uuid } => {
+                    trace!("Client presenting uuid: {uuid:x?}");
+                }
+                ArchivedEvent::Subscribe { .. } => {}
+                ArchivedEvent::GetTreeOverview { .. } => {}
+                ArchivedEvent::TreeOverview { .. } => {}
+                ArchivedEvent::RecordChanged { change, meta, data } => {
+                    trace!("hot change: {change:?}");
+                }
+                ArchivedEvent::GetKeySet { .. } => {}
+                ArchivedEvent::KeySet { .. } => {}
+                ArchivedEvent::CheckOut { .. } => {}
+                ArchivedEvent::Return { .. } => {}
+                ArchivedEvent::CheckedOut { .. } => {}
+                ArchivedEvent::AlreadyCheckedOut { .. } => {}
+            }
         }
         u => {
             warn!("Unsupported ws message: {u:?}");
         }
     }
 
-    false
+    Ok(())
 }
 
 // pub(crate) async fn serialize_and_send(ev: AddressableEvent, ws_sink: impl Sink<Message>) -> bool {

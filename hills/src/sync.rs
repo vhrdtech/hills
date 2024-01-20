@@ -1,3 +1,4 @@
+use crate::record::RecordMeta;
 use hills_base::GenericKey;
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,10 +34,10 @@ pub enum ChangeKind {
     Remove,
 }
 
-#[derive(Archive, Debug, Serialize, Deserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
-pub enum ClientEvent {
+#[derive(Archive, Serialize, Deserialize)]
+// #[archive(check_bytes)]
+// #[archive_attr(derive(Debug))]
+pub enum Event {
     PresentSelf {
         uuid: [u8; 16],
     },
@@ -53,12 +54,16 @@ pub enum ClientEvent {
     },
     RecordChanged {
         change: RecordHotChange,
-        meta: AlignedVec,
+        meta: Option<RecordMeta>,
         data: Option<AlignedVec>,
     },
 
     GetKeySet {
         tree: String,
+    },
+    KeySet {
+        tree: String,
+        keys: Range<u32>,
     },
 
     CheckOut {
@@ -69,33 +74,6 @@ pub enum ClientEvent {
         tree: String,
         key: Vec<GenericKey>,
     },
-}
-
-#[derive(Archive, Debug, Serialize, Deserialize)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
-pub enum ServerEvent {
-    PresentSelf {
-        uuid: [u8; 16],
-    },
-
-    GetTreeOverview {
-        tree: String,
-    },
-    TreeOverview {
-        tree: String,
-        records: HashMap<GenericKey, RecordIteration>,
-    },
-    RecordChanged {
-        change: RecordHotChange,
-        meta: AlignedVec,
-        data: Option<AlignedVec>,
-    },
-
-    KeySet {
-        keys: Range<u32>,
-    },
-
     CheckedOut {
         tree: String,
         keys: Vec<GenericKey>,

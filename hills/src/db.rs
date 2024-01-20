@@ -3,6 +3,7 @@ use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::{ChangeKind, RecordHotChange};
 use crate::sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbSyncHandle};
+use crate::sync_common::SELF_UUID;
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::{VhrdDbCmdTx, VhrdDbTelem};
 use chrono::Utc;
@@ -153,7 +154,7 @@ impl VhrdDbClient {
         let db = sled::Config::new().temporary(true).path(path).open()?;
         let descriptors = db.open_tree("descriptors")?;
 
-        let self_uuid = match db.get(b"self_uuid")? {
+        let self_uuid = match db.get(SELF_UUID)? {
             Some(uuid_bytes) => {
                 if uuid_bytes.len() != 16 {
                     return Err(Error::Internal("Invalid self_uuid".into()));
@@ -166,7 +167,7 @@ impl VhrdDbClient {
                 let uuid = Uuid::new_v4();
                 trace!("Created new db, uuid={uuid}");
                 let uuid_bytes = uuid.into_bytes();
-                db.insert(b"node_id", &uuid_bytes)?;
+                db.insert(SELF_UUID, &uuid_bytes)?;
                 uuid
             }
         };
@@ -600,19 +601,7 @@ where
     pub fn latest_revisions(&self) -> impl Iterator<Item = K> {
         self.latest_revision_index.iter().keys().filter_map(|key| {
             if let Ok(key) = key {
-                if key.len() < 8 {
-                    warn!("Wrong key in latest_revisions");
-                    return None;
-                }
-                // Alignment 2 is returned here (:
-                // let key = unsafe { rkyv::archived_root::<GenericKey>(&key) };
-                // let key: GenericKey = key.deserialize(&mut rkyv::Infallible)?;
-                let mut word = [0u8; 4];
-                word.copy_from_slice(&key[0..=3]);
-                let id = u32::from_le_bytes(word);
-                word.copy_from_slice(&key[4..=7]);
-                let revision = u32::from_le_bytes(word);
-                let key = GenericKey { id, revision };
+                let key = GenericKey::from_bytes(&key)?;
                 let key = K::from_generic(key);
                 Some(key)
             } else {

@@ -1,12 +1,15 @@
-use crate::sync::{ClientEvent, RecordHotChange};
+use crate::handle_result;
+use crate::sync::{ArchivedEvent, Event, RecordHotChange};
+use crate::sync_common::Error;
+use crate::sync_common::{present_self, send_hot_change};
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    Sink, SinkExt, StreamExt,
+    StreamExt, TryStreamExt,
 };
 use log::{info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::to_bytes;
+use rkyv::archived_root;
 use sled::Db;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -58,7 +61,7 @@ pub struct SyncClientTelemetry {
 pub type VhrdDbTelem = Arc<RwLock<SyncClientTelemetry>>;
 
 async fn event_loop(
-    db: Db,
+    mut db: Db,
     mut event_rx: Receiver<RecordHotChange>,
     mut cmd_rx: Receiver<SyncClientCommand>,
     telem: VhrdDbTelem,
@@ -67,7 +70,47 @@ async fn event_loop(
     let mut to_replay = Vec::new();
 
     loop {
+        let mut should_disconnect = false;
         if let Some((ws_tx, ws_rx)) = &mut ws_txrx {
+            tokio::select! {
+                message = ws_rx.try_next() => {
+                    match message {
+                        Ok(Some(message)) => {
+                            if let Message::Close(_) = &message {
+                                should_disconnect = true;
+                            }
+                            let r = process_message(message, &mut db).await;
+                            handle_result!(r);
+                        }
+                        Ok(None) => {
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("{e}");
+                            break;
+                        }
+                    }
+                }
+                cmd = cmd_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        info!("Sync client: tx end no longer exist, exiting");
+                        break;
+                    };
+                    match cmd {
+                        SyncClientCommand::Disconnect => {
+                            should_disconnect = true;
+                        }
+                        SyncClientCommand::Connect(..) => {}
+                    }
+                }
+                event = event_rx.recv() => {
+                    trace!("ev: {event:?}");
+                    if let Some(event) = event {
+                        let r = send_hot_change(&db, event, ws_tx).await;
+                        handle_result!(r);
+                    }
+                }
+            }
         } else {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -114,21 +157,43 @@ async fn event_loop(
                 }
             }
         }
+
+        if should_disconnect {
+            if let Some((ws_tx, ws_rx)) = ws_txrx.take() {
+                if let Ok(mut ws) = ws_rx.reunite(ws_tx) {
+                    let _ = ws.close(None).await;
+                }
+            }
+        }
     }
 }
 
-async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) {
-    let Some(uuid_bytes) = db.get(b"self_uuid").unwrap() else {
-        return;
-    };
-    if uuid_bytes.len() != 16 {
-        return;
+async fn process_message(ws_message: Message, _db: &mut Db) -> Result<(), Error> {
+    match ws_message {
+        Message::Binary(bytes) => {
+            let ev = unsafe { archived_root::<Event>(&bytes) };
+            match ev {
+                ArchivedEvent::PresentSelf { uuid } => {
+                    trace!("Server uuid is: {uuid:x?}");
+                }
+                ArchivedEvent::Subscribe { .. } => {}
+                ArchivedEvent::GetTreeOverview { .. } => {}
+                ArchivedEvent::TreeOverview { .. } => {}
+                ArchivedEvent::RecordChanged { .. } => {}
+                ArchivedEvent::GetKeySet { .. } => {}
+                ArchivedEvent::KeySet { tree, keys } => {
+                    trace!("Got more keys for {tree} {keys:?}");
+                }
+                ArchivedEvent::CheckOut { .. } => {}
+                ArchivedEvent::Return { .. } => {}
+                ArchivedEvent::CheckedOut { .. } => {}
+                ArchivedEvent::AlreadyCheckedOut { .. } => {}
+            }
+        }
+        u => {
+            warn!("Unsupported ws message: {u:?}");
+        }
     }
-    let mut uuid = [0u8; 16];
-    uuid[..].copy_from_slice(&uuid_bytes);
-    let id_event = ClientEvent::PresentSelf { uuid };
-    let id_event = to_bytes::<_, 8>(&id_event).unwrap();
-    tx.feed(Message::Binary(id_event.to_vec())).await;
 
-    tx.flush().await;
+    Ok(())
 }

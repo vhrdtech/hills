@@ -29,4 +29,23 @@ impl GenericKey {
             None
         }
     }
+
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes[0..=3].copy_from_slice(&self.id.to_be_bytes());
+        bytes[4..=7].copy_from_slice(&self.revision.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 8 {
+            return None;
+        }
+        let mut word = [0u8; 4];
+        word.copy_from_slice(&bytes[0..=3]);
+        let id = u32::from_be_bytes(word);
+        word.copy_from_slice(&bytes[4..=7]);
+        let revision = u32::from_be_bytes(word);
+        Some(GenericKey { id, revision })
+    }
 }
