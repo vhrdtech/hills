@@ -1,9 +1,10 @@
+use crate::common::ManagedTrees;
+use crate::consts::{KEY_POOL, SELF_UUID};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::{ChangeKind, RecordHotChange};
 use crate::sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbSyncHandle};
-use crate::sync_common::{ManagedTrees, MANAGED_TREES, SELF_UUID};
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::{VhrdDbCmdTx, VhrdDbTelem};
 use chrono::Utc;
@@ -70,6 +71,7 @@ pub struct TreeBundle<K, V> {
     _phantom_v: PhantomData<V>,
 }
 
+// TODO: Make one common error?
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
@@ -139,6 +141,19 @@ impl<T: Debug> From<TransactionError<T>> for Error {
         match value {
             TransactionError::Abort(e) => Error::Internal(format!("{e:?}")),
             TransactionError::Storage(e) => Error::Sled(e),
+        }
+    }
+}
+
+use crate::common::Error as CommonError;
+impl From<CommonError> for Error {
+    fn from(value: CommonError) -> Self {
+        match value {
+            CommonError::Sled(e) => Error::Sled(e),
+            CommonError::Internal(e) => Error::Internal(e),
+            CommonError::Ws => Error::Internal("common::Error::Ws".to_string()),
+            CommonError::RkyvSerializeError(e) => Error::RkyvSerializeError(e),
+            CommonError::RkyvDeserializeError(e) => Error::RkyvDeserializeError(e),
         }
     }
 }
@@ -216,26 +231,7 @@ impl VhrdDbClient {
             ));
         }
 
-        match self.db.get(MANAGED_TREES)? {
-            Some(trees) => {
-                let trees = check_archived_root::<ManagedTrees>(&trees)?;
-                if !trees.trees.contains(tree_name) {
-                    let mut trees: ManagedTrees =
-                        trees.deserialize(&mut rkyv::Infallible).expect("");
-                    trees.trees.insert(tree_name.to_string());
-                    let trees_bytes = to_bytes::<_, 128>(&trees)?;
-                    self.db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
-                }
-            }
-            None => {
-                let trees = ManagedTrees {
-                    trees: [tree_name.to_string()].into(),
-                    _dummy22: [0u8; 18],
-                };
-                let trees_bytes = to_bytes::<_, 128>(&trees)?;
-                self.db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
-            }
-        }
+        ManagedTrees::add_to_managed(&self.db, tree_name)?;
 
         match self.open_trees.get(tree_name) {
             Some(raw_tree) => Ok(TreeBundle {
@@ -388,37 +384,34 @@ where
     }
 
     pub fn key_pool_stats(&self) -> Result<u32, Error> {
-        KeyPool::stats_for(&self.data).map_err(Error::Internal)
+        Ok(KeyPool::stats_for(&self.data)?)
     }
 
     fn get_next_key(&mut self) -> Result<u32, Error> {
-        self.data
-            .transaction(|tx_db| match tx_db.get(b"_key_pool")? {
-                Some(key_pool) => {
-                    // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
-                    let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
-                        .map_err(|_| {
-                            ConflictableTransactionError::Abort("checked_archived_root")
-                        })?;
-                    let mut key_pool: KeyPool =
-                        key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
-                            ConflictableTransactionError::Abort("get_next_key: deserialize")
-                        })?;
-                    let next_key = match key_pool.get() {
-                        Some(next_key) => {
-                            let key_pool = to_bytes::<_, 8>(&key_pool)
-                                .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
-                            tx_db.insert(b"_key_pool", &*key_pool)?;
-                            next_key
-                        }
-                        None => {
-                            return Ok(Err(Error::OutOfKeys));
-                        }
-                    };
-                    Ok(Ok(next_key))
-                }
-                None => Ok(Err(Error::OutOfKeys)),
-            })?
+        self.data.transaction(|tx_db| match tx_db.get(KEY_POOL)? {
+            Some(key_pool) => {
+                // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
+                let key_pool: &ArchivedKeyPool = check_archived_root::<KeyPool>(&key_pool)
+                    .map_err(|_| ConflictableTransactionError::Abort("checked_archived_root"))?;
+                let mut key_pool: KeyPool =
+                    key_pool.deserialize(&mut rkyv::Infallible).map_err(|_| {
+                        ConflictableTransactionError::Abort("get_next_key: deserialize")
+                    })?;
+                let next_key = match key_pool.get() {
+                    Some(next_key) => {
+                        let key_pool = to_bytes::<_, 8>(&key_pool)
+                            .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
+                        tx_db.insert(KEY_POOL, &*key_pool)?;
+                        next_key
+                    }
+                    None => {
+                        return Ok(Err(Error::OutOfKeys));
+                    }
+                };
+                Ok(Ok(next_key))
+            }
+            None => Ok(Err(Error::OutOfKeys)),
+        })?
     }
 
     pub fn insert(&mut self, value: V) -> Result<K, Error> {
@@ -597,6 +590,22 @@ where
                 Some(key)
             } else {
                 warn!("Err in latest_revisions");
+                None
+            }
+        })
+    }
+
+    pub fn all_revisions(&self) -> impl Iterator<Item = K> {
+        self.data.iter().keys().filter_map(|key| {
+            if let Ok(key) = key {
+                if key == KEY_POOL {
+                    return None;
+                }
+                let key = GenericKey::from_bytes(&key)?;
+                let key = K::from_generic(key);
+                Some(key)
+            } else {
+                warn!("Err in all_revisions");
                 None
             }
         })

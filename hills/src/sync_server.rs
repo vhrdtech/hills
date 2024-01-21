@@ -1,14 +1,14 @@
-use crate::handle_result;
-use crate::record::{Record, RecordMeta};
+use crate::common::{Error, ManagedTrees};
+use crate::consts::SELF_UUID;
 use crate::sync::{ArchivedEvent, Event, RecordHotChange};
-use crate::sync_common::{present_self, Error, SELF_UUID};
+use crate::sync_common::{
+    compare_and_request_missing_records, present_self, send_records, send_tree_overviews,
+};
+use crate::{handle_result, sync_common};
 use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use hills_base::GenericKey;
 use log::{error, info, trace, warn};
-use rkyv::{
-    archived_root, check_archived_root, to_bytes, AlignedVec, Archive, Deserialize, Serialize,
-};
-use sled::transaction::ConflictableTransactionError;
+use rkyv::{archived_root, check_archived_root, to_bytes, Archive, Deserialize, Serialize};
 use sled::Db;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -88,6 +88,7 @@ impl HillsServer {
 }
 
 async fn ws_server_acceptor(listener: TcpListener, db: Db) {
+    info!("Server event loop started");
     loop {
         match listener.accept().await {
             Ok((tcp_stream, remote_addr)) => {
@@ -126,6 +127,8 @@ async fn ws_event_loop(
 ) {
     info!("Event loop started");
     let r = present_self(&db, &mut ws_tx).await;
+    handle_result!(r);
+    let r = send_tree_overviews(&db, &mut ws_tx).await;
     handle_result!(r);
     loop {
         tokio::select! {
@@ -194,36 +197,46 @@ async fn process_message(
                     }
                 }
                 ArchivedEvent::GetTreeOverview { .. } => {}
-                ArchivedEvent::TreeOverview { .. } => {}
+                ArchivedEvent::TreeOverview { tree, records } => {
+                    trace!("Got {}/{tree} overview {records:?}", state.remote_addr);
+                    compare_and_request_missing_records(db, tree, records, &mut ws_tx)
+                        .await
+                        .unwrap();
+                }
                 ArchivedEvent::GetKeySet { tree } => {
                     let key_count = 10;
                     trace!("{}: GetKeySet for {tree}", state.remote_addr);
                     let Some(client_info) = &mut state.info else {
                         return Ok(());
                     };
-                    let next_key = db
-                        .transaction(|db_tx| {
-                            let key = format!("{tree}_info");
-                            if let Some(tree_info_bytes) = db_tx.get(key.as_bytes())? {
-                                let tree_info = check_archived_root::<TreeInfo>(&tree_info_bytes)
-                                    .map_err(ConflictableTransactionError::Abort)?;
-                                let next_key: u32 = tree_info.next_key;
-                                let tree_info = TreeInfo {
-                                    next_key: next_key + key_count,
-                                    ..Default::default()
-                                };
-                                let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
-                                db_tx.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
-                                Ok(next_key)
-                            } else {
-                                trace!("New tree {tree}");
-                                let tree_info = TreeInfo::default();
-                                let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
-                                db_tx.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
-                                Ok(0u32)
-                            }
-                        })
-                        .map_err(|_| Error::Internal("sled transaction failed".into()))?;
+                    // let next_key = db.transaction::<_, _, Error>(|db_tx| {
+                    let next_key = {
+                        let key = format!("{tree}_info");
+                        if let Some(tree_info_bytes) = db.get(key.as_bytes())? {
+                            let tree_info =
+                                check_archived_root::<TreeInfo>(&tree_info_bytes).unwrap();
+                            let next_key: u32 = tree_info.next_key;
+                            trace!("next_key is {next_key}");
+                            let tree_info = TreeInfo {
+                                next_key: next_key + key_count,
+                                ..Default::default()
+                            };
+                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
+                            db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
+                            next_key
+                        } else {
+                            trace!("New tree {tree}");
+                            ManagedTrees::add_to_managed(db, tree).unwrap();
+                            let tree_info = TreeInfo {
+                                next_key: key_count,
+                                ..Default::default()
+                            };
+                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
+                            db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
+                            0u32
+                        }
+                        // }).unwrap();
+                    };
                     let new_range = next_key..next_key + key_count;
                     let ev = Event::KeySet {
                         tree: tree.to_string(),
@@ -268,111 +281,35 @@ async fn process_message(
                         error!("Record hot update ignored, because client is not registered yet");
                         return Ok(());
                     };
-                    let key = GenericKey::new(key.id, key.revision);
+                    let key = GenericKey::from_archived(key);
                     if let ArchivedEvent::RecordCreated { .. } = client_event {
                         if !client_info.owns_key(tree, key) {
                             warn!(
-                                "{} tried to create a record with invalid id {}",
+                                "{} tried to create a record with id {} it doesn't own",
                                 state.remote_addr, key
                             );
                             return Ok(());
                         }
                     }
+                    let remote_name = format!("{}", state.remote_addr);
+                    sync_common::handle_incoming_record(db, client_event, &remote_name)?;
+                }
+                ArchivedEvent::RequestRecords { tree, keys } => {
+                    send_records(db, tree.as_str(), keys, &mut ws_tx).await?;
+                }
+                ArchivedEvent::RecordAsRequested {
+                    tree_name,
+                    key,
+                    record,
+                } => {
+                    let tree = db.open_tree(tree_name.as_str())?;
+                    let key = GenericKey::from_archived(key);
                     let key_bytes = key.to_bytes();
-                    let db_tree = db.open_tree(tree.as_str())?;
-                    match client_event {
-                        ArchivedEvent::RecordCreated { meta, data, .. } => {
-                            let mut new_data = AlignedVec::new();
-                            let meta: RecordMeta =
-                                meta.deserialize(&mut rkyv::Infallible).expect("");
-                            new_data.extend_from_slice(data.as_slice());
-                            let record = Record {
-                                meta_iteration: 0,
-                                meta,
-                                data_iteration: 0,
-                                data: new_data,
-                            };
-                            let record_bytes = to_bytes::<_, 128>(&record)?;
-                            db.insert(&key_bytes, record_bytes.as_slice())?;
-                            trace!("created record {}/{}", tree, key);
-                        }
-                        ArchivedEvent::RecordMetaChanged {
-                            meta,
-                            meta_iteration,
-                            ..
-                        }
-                        | ArchivedEvent::RecordChanged {
-                            meta,
-                            meta_iteration,
-                            ..
-                        } => {
-                            let Some(record) = db_tree.get(key_bytes)? else {
-                                error!(
-                                    "{} tried to modify non-existing record: {}/{}",
-                                    state.remote_addr, tree, key
-                                );
-                                return Ok(());
-                            };
-                            let old_record = unsafe { archived_root::<Record>(&record) };
-                            let meta: RecordMeta =
-                                meta.deserialize(&mut rkyv::Infallible).expect("");
-
-                            match client_event {
-                                ArchivedEvent::RecordMetaChanged { .. } => {
-                                    let mut old_data = AlignedVec::new();
-                                    old_data.extend_from_slice(old_record.data.as_slice());
-                                    let record = Record {
-                                        meta_iteration: *meta_iteration,
-                                        meta,
-                                        data_iteration: old_record.data_iteration,
-                                        data: old_data,
-                                    };
-                                    let record_bytes = to_bytes::<_, 128>(&record)?;
-                                    db.insert(&key_bytes, record_bytes.as_slice())?;
-                                    trace!(
-                                        "updated meta {}/{} m.it{}->{}",
-                                        tree,
-                                        key,
-                                        old_record.meta_iteration,
-                                        meta_iteration
-                                    );
-                                }
-                                ArchivedEvent::RecordChanged {
-                                    data,
-                                    data_iteration,
-                                    ..
-                                } => {
-                                    let mut new_data = AlignedVec::new();
-                                    new_data.extend_from_slice(data.as_slice());
-                                    let record = Record {
-                                        meta_iteration: *meta_iteration,
-                                        meta,
-                                        data_iteration: *data_iteration,
-                                        data: new_data,
-                                    };
-                                    let record_bytes = to_bytes::<_, 128>(&record)?;
-                                    db.insert(&key_bytes, record_bytes.as_slice())?;
-                                    trace!(
-                                        "updated record {}/{} d.it{}->{}",
-                                        tree,
-                                        key,
-                                        old_record.data_iteration,
-                                        data_iteration
-                                    );
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        ArchivedEvent::RecordRemoved { .. } => {
-                            if db_tree.remove(&key_bytes)?.is_none() {
-                                warn!(
-                                    "{} tried to remove non-existing record: {}/{}",
-                                    state.remote_addr, tree, key
-                                );
-                                return Ok(());
-                            }
-                        }
-                        _ => unreachable!(),
+                    if tree.contains_key(key_bytes)? {
+                        warn!("{tree_name}/{key} already exist");
+                    } else {
+                        tree.insert(key_bytes, record.as_slice())?;
+                        trace!("{tree_name}/{key} inserted");
                     }
                 }
             }

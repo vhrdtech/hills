@@ -20,6 +20,13 @@ impl GenericKey {
         GenericKey { id, revision }
     }
 
+    pub fn from_archived(a: &ArchivedGenericKey) -> Self {
+        GenericKey {
+            id: a.id,
+            revision: a.revision,
+        }
+    }
+
     pub fn previous_revision(&self) -> Option<Self> {
         if self.revision > 0 {
             Some(GenericKey {

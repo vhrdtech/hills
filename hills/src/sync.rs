@@ -81,6 +81,16 @@ pub enum Event {
         key: GenericKey,
     },
 
+    RequestRecords {
+        tree: String,
+        keys: Vec<GenericKey>,
+    },
+    RecordAsRequested {
+        tree_name: String,
+        key: GenericKey,
+        record: AlignedVec,
+    },
+
     GetKeySet {
         tree: String,
     },
@@ -112,6 +122,6 @@ pub enum Event {
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct RecordIteration {
-    meta_iteration: u32,
-    data_iteration: u32,
+    pub meta_iteration: u32,
+    pub data_iteration: u32,
 }

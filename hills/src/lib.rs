@@ -1,3 +1,5 @@
+mod common;
+mod consts;
 pub mod db;
 mod journal;
 mod key_pool;
@@ -10,3 +12,5 @@ pub mod tree;
 
 pub use db::{TreeBundle, VhrdDbClient};
 pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
+
+// TODO: remove unwraps

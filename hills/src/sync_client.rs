@@ -1,16 +1,20 @@
+use crate::common::{Error, ManagedTrees};
 use crate::handle_result;
 use crate::key_pool::KeyPool;
 use crate::sync::{ArchivedEvent, Event, RecordHotChange};
-use crate::sync_common::{present_self, send_hot_change};
-use crate::sync_common::{Error, ManagedTrees, MANAGED_TREES};
+use crate::sync_common::{
+    compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
+    send_records, send_tree_overviews,
+};
 use futures_util::{
     stream::{SplitSink, SplitStream},
     Sink, SinkExt, StreamExt, TryStreamExt,
 };
+use hills_base::GenericKey;
 use log::{info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::{archived_root, check_archived_root, to_bytes};
+use rkyv::{archived_root, to_bytes};
 use sled::Db;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -68,7 +72,7 @@ async fn event_loop(
     telem: VhrdDbTelem,
 ) {
     let mut ws_txrx: Option<(SplitSink<_, _>, SplitStream<_>)> = None;
-    let mut to_replay = Vec::new();
+    // let mut to_replay = Vec::new();
 
     loop {
         let mut should_disconnect = false;
@@ -80,7 +84,7 @@ async fn event_loop(
                             if let Message::Close(_) = &message {
                                 should_disconnect = true;
                             }
-                            let r = process_message(message, &mut db).await;
+                            let r = process_message(message, &mut db, ws_tx).await;
                             handle_result!(r);
                         }
                         Ok(None) => {
@@ -145,6 +149,8 @@ async fn event_loop(
                             handle_result!(r);
                             let r = request_keys(&db, &mut ws_tx).await;
                             handle_result!(r);
+                            let r = send_tree_overviews(&db, &mut ws_tx).await;
+                            handle_result!(r);
                             ws_txrx = Some((ws_tx, ws_rx));
                         }
                         SyncClientCommand::Disconnect => {}
@@ -152,10 +158,10 @@ async fn event_loop(
                 }
                 event = event_rx.recv() => {
                     trace!("ev: {event:?}");
-                    if let Some(event) = event {
-                        to_replay.push(event);
+                    if let Some(_event) = event {
+                        // to_replay.push(event);
                         if let Ok(mut telem) = telem.write() {
-                            telem.backlog = to_replay.len();
+                            telem.backlog += 1;
                         }
                     }
                 }
@@ -172,7 +178,11 @@ async fn event_loop(
     }
 }
 
-async fn process_message(ws_message: Message, db: &mut Db) -> Result<(), Error> {
+async fn process_message(
+    ws_message: Message,
+    db: &mut Db,
+    mut ws_tx: impl Sink<Message> + Unpin,
+) -> Result<(), Error> {
     match ws_message {
         Message::Binary(bytes) => {
             let ev = unsafe { archived_root::<Event>(&bytes) };
@@ -182,7 +192,12 @@ async fn process_message(ws_message: Message, db: &mut Db) -> Result<(), Error> 
                 }
                 ArchivedEvent::Subscribe { .. } => {}
                 ArchivedEvent::GetTreeOverview { .. } => {}
-                ArchivedEvent::TreeOverview { .. } => {}
+                ArchivedEvent::TreeOverview { tree, records } => {
+                    trace!("Got {tree} overview {records:?}");
+                    compare_and_request_missing_records(db, tree, records, &mut ws_tx)
+                        .await
+                        .unwrap();
+                }
                 ArchivedEvent::KeySet { tree, keys } => {
                     trace!("Got more keys for {tree} {keys:?}");
                     let tree = db.open_tree(tree.as_str())?;
@@ -191,14 +206,34 @@ async fn process_message(ws_message: Message, db: &mut Db) -> Result<(), Error> 
                 }
                 ArchivedEvent::CheckedOut { .. } => {}
                 ArchivedEvent::AlreadyCheckedOut { .. } => {}
-                ArchivedEvent::RecordCreated { .. } => {}
-                ArchivedEvent::RecordMetaChanged { .. } => {}
-                ArchivedEvent::RecordChanged { .. } => {}
-                ArchivedEvent::RecordRemoved { .. } => {}
+                ArchivedEvent::RecordCreated { .. }
+                | ArchivedEvent::RecordMetaChanged { .. }
+                | ArchivedEvent::RecordChanged { .. }
+                | ArchivedEvent::RecordRemoved { .. } => {
+                    handle_incoming_record(db, ev, "server")?;
+                }
                 ArchivedEvent::CheckOut { .. }
                 | ArchivedEvent::Return { .. }
                 | ArchivedEvent::GetKeySet { .. } => {
                     warn!("Unsupported event from server");
+                }
+                ArchivedEvent::RequestRecords { tree, keys } => {
+                    send_records(db, tree.as_str(), keys, &mut ws_tx).await?;
+                }
+                ArchivedEvent::RecordAsRequested {
+                    tree_name,
+                    key,
+                    record,
+                } => {
+                    let tree = db.open_tree(tree_name.as_str())?;
+                    let key = GenericKey::from_archived(key);
+                    let key_bytes = key.to_bytes();
+                    if tree.contains_key(key_bytes)? {
+                        warn!("{tree_name}/{key} already exist");
+                    } else {
+                        tree.insert(key_bytes, record.as_slice())?;
+                        trace!("{tree_name}/{key} inserted");
+                    }
                 }
             }
         }
@@ -211,23 +246,20 @@ async fn process_message(ws_message: Message, db: &mut Db) -> Result<(), Error> 
 }
 
 pub async fn request_keys(db: &Db, ws_tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
-    if let Some(trees) = db.get(MANAGED_TREES)? {
-        let trees = check_archived_root::<ManagedTrees>(&trees)?;
-        let trees: Vec<String> = trees.trees.iter().map(|name| name.to_string()).collect();
-        for tree_name in &trees {
-            let tree = db.open_tree(tree_name.as_str())?;
-            let available_keys = KeyPool::stats_for(&tree).map_err(Error::Internal)?;
-            trace!("request_keys: {} available: {}", tree_name, available_keys);
-            if available_keys < 3 {
-                let ev = Event::GetKeySet {
-                    tree: tree_name.to_string(),
-                };
-                let ev_bytes = to_bytes::<_, 128>(&ev)?;
-                ws_tx
-                    .feed(Message::Binary(ev_bytes.to_vec()))
-                    .await
-                    .map_err(|_| Error::Ws)?;
-            }
+    let trees = ManagedTrees::managed(db)?;
+    for tree_name in &trees {
+        let tree = db.open_tree(tree_name.as_str())?;
+        let available_keys = KeyPool::stats_for(&tree)?;
+        trace!("request_keys: {} available: {}", tree_name, available_keys);
+        if available_keys < 3 {
+            let ev = Event::GetKeySet {
+                tree: tree_name.to_string(),
+            };
+            let ev_bytes = to_bytes::<_, 128>(&ev)?;
+            ws_tx
+                .feed(Message::Binary(ev_bytes.to_vec()))
+                .await
+                .map_err(|_| Error::Ws)?;
         }
     }
     ws_tx.flush().await.map_err(|_| Error::Ws)?;
