@@ -37,7 +37,7 @@ pub enum ChangeKind {
 }
 
 // TODO: Switch to serde with &[u8] support to avoid copying data buffer many times?
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Clone, Serialize, Deserialize)]
 // #[archive(check_bytes)]
 // #[archive_attr(derive(Debug))]
 pub enum Event {
@@ -118,7 +118,7 @@ pub enum Event {
     },
 }
 
-#[derive(Archive, Debug, Serialize, Deserialize)]
+#[derive(Archive, Clone, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct RecordIteration {

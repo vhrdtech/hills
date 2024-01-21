@@ -186,6 +186,9 @@ macro_rules! handle_result {
             Err(Error::RkyvDeserializeError(_)) => {
                 log::warn!("rkyv deser error");
             }
+            Err(Error::PostageBroadcast) => {
+                log::error!("postage broadcast failed");
+            }
             Ok(_) => {}
         }
     }};

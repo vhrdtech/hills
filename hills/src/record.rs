@@ -27,7 +27,7 @@ pub struct Record {
     pub data: AlignedVec,
 }
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(Archive, Clone, Serialize, Deserialize)]
 pub struct RecordMeta {
     /// Same ID as in a Record's key
     pub key: GenericKey,
@@ -55,7 +55,7 @@ pub struct RecordMeta {
 }
 
 /// Record state
-#[derive(Archive, Debug, Serialize, Deserialize)]
+#[derive(Archive, Clone, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub enum Version {

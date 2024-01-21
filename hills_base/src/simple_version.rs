@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
-#[derive(Archive, PartialEq, Eq, Debug, Copy, Clone, Hash, Serialize, Deserialize)]
+#[derive(Archive, Clone, PartialEq, Eq, Debug, Copy, Hash, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Debug, Hash))]
 pub struct SimpleVersion {

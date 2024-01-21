@@ -154,6 +154,7 @@ impl From<CommonError> for Error {
             CommonError::Ws => Error::Internal("common::Error::Ws".to_string()),
             CommonError::RkyvSerializeError(e) => Error::RkyvSerializeError(e),
             CommonError::RkyvDeserializeError(e) => Error::RkyvDeserializeError(e),
+            CommonError::PostageBroadcast => Error::Internal("postage broadcasr".into()),
         }
     }
 }

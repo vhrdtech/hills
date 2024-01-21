@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("rkyv check_archived_root failed: {}", .0)]
     RkyvDeserializeError(String),
+
+    #[error("broadcast channel error")]
+    PostageBroadcast,
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
