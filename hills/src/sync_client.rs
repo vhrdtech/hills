@@ -199,9 +199,7 @@ async fn process_message(
                 ArchivedEvent::GetTreeOverview { .. } => {}
                 ArchivedEvent::TreeOverview { tree, records } => {
                     trace!("Got {tree} overview {records:?}");
-                    compare_and_request_missing_records(db, tree, records, &mut ws_tx)
-                        .await
-                        .unwrap();
+                    compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
                 }
                 ArchivedEvent::KeySet { tree, keys } => {
                     trace!("Got more keys for {tree} {keys:?}");

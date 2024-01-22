@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -68,7 +68,11 @@ struct State {
 }
 
 impl HillsServer {
-    pub fn start<P: AsRef<Path>>(path: P, rt: &Runtime) -> Result<Self, Error> {
+    pub fn start<P: AsRef<Path>, A: ToSocketAddrs + Send + 'static>(
+        path: P,
+        addr: A,
+        rt: &Runtime,
+    ) -> Result<Self, Error> {
         #[cfg(not(test))]
         let db = sled::open(path)?;
         #[cfg(test)]
@@ -82,7 +86,7 @@ impl HillsServer {
         }
 
         let join = rt.spawn(async move {
-            let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
+            let listener = TcpListener::bind(addr).await.unwrap();
             ws_server_acceptor(listener, db).await;
         });
 
@@ -227,9 +231,7 @@ async fn process_message(
                 ArchivedEvent::GetTreeOverview { .. } => {}
                 ArchivedEvent::TreeOverview { tree, records } => {
                     trace!("Got {}/{tree} overview {records:?}", state.remote_addr);
-                    compare_and_request_missing_records(db, tree, records, &mut ws_tx)
-                        .await
-                        .unwrap();
+                    compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
                 }
                 ArchivedEvent::GetKeySet { tree } => {
                     let key_count = 10;
@@ -242,25 +244,24 @@ async fn process_message(
                     let next_key = {
                         let key = format!("{tree}_info");
                         if let Some(tree_info_bytes) = db.get(key.as_bytes())? {
-                            let tree_info =
-                                check_archived_root::<TreeInfo>(&tree_info_bytes).unwrap();
+                            let tree_info = check_archived_root::<TreeInfo>(&tree_info_bytes)?;
                             let next_key: u32 = tree_info.next_key;
                             trace!("next_key is {next_key}");
                             let tree_info = TreeInfo {
                                 next_key: next_key + key_count,
                                 ..Default::default()
                             };
-                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
+                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info)?;
                             db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
                             next_key
                         } else {
                             trace!("New tree {tree}");
-                            ManagedTrees::add_to_managed(db, tree).unwrap();
+                            ManagedTrees::add_to_managed(db, tree)?;
                             let tree_info = TreeInfo {
                                 next_key: key_count,
                                 ..Default::default()
                             };
-                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info).unwrap();
+                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info)?;
                             db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
                             0u32
                         }

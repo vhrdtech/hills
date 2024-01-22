@@ -517,7 +517,7 @@ where
                     .meta
                     .created
                     .deserialize(&mut rkyv::Infallible)
-                    .unwrap(),
+                    .expect(""),
                 rust_version: SimpleVersion::rust_version(),
                 rkyv_version: SimpleVersion::rkyv_version(),
                 evolution: <V as TreeRoot>::evolution(),

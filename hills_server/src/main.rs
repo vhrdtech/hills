@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let server = HillsServer::start("server_play_db", &runtime)?;
+    let server = HillsServer::start("server_play_db", "0.0.0.0:7070", &runtime)?;
     runtime.block_on(server.join)?;
     Ok(())
 }

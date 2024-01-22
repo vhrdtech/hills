@@ -27,7 +27,7 @@ pub async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) -> Res
     let mut uuid = [0u8; 16];
     uuid[..].copy_from_slice(&uuid_bytes);
     let id_event = Event::PresentSelf { uuid };
-    let id_event = to_bytes::<_, 8>(&id_event).unwrap();
+    let id_event = to_bytes::<_, 8>(&id_event)?;
     tx.feed(Message::Binary(id_event.to_vec()))
         .await
         .map_err(|_| Error::Ws)?;
