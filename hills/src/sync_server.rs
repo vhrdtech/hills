@@ -1,7 +1,6 @@
 use crate::common::{Error, ManagedTrees};
 use crate::consts::SELF_UUID;
-use crate::record::RecordMeta;
-use crate::sync::{ArchivedEvent, Event, RecordHotChange};
+use crate::sync::{ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, RecordHotChange};
 use crate::sync_common::{
     compare_and_request_missing_records, present_self, send_records, send_tree_overviews,
 };
@@ -9,9 +8,7 @@ use crate::{handle_result, sync_common};
 use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use hills_base::GenericKey;
 use log::{error, info, trace, warn};
-use rkyv::{
-    archived_root, check_archived_root, to_bytes, AlignedVec, Archive, Deserialize, Serialize,
-};
+use rkyv::{archived_root, check_archived_root, to_bytes, Archive, Deserialize, Serialize};
 use sled::Db;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -92,7 +89,7 @@ impl HillsServer {
 
 async fn ws_server_acceptor(listener: TcpListener, db: Db) {
     info!("Server event loop started");
-    let (broadcast_tx, broadcast_rx) = postage::broadcast::channel::<Event>(256);
+    let (broadcast_tx, broadcast_rx) = postage::broadcast::channel(256);
     loop {
         match listener.accept().await {
             Ok((tcp_stream, remote_addr)) => {
@@ -130,8 +127,8 @@ async fn ws_event_loop(
     mut ws_rx: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     mut db: Db,
     mut state: State,
-    mut broadcast_rx: postage::broadcast::Receiver<Event>,
-    mut broadcast_tx: postage::broadcast::Sender<Event>,
+    mut broadcast_rx: postage::broadcast::Receiver<HotSyncEvent>,
+    mut broadcast_tx: postage::broadcast::Sender<HotSyncEvent>,
 ) {
     info!("Event loop started");
     let r = present_self(&db, &mut ws_tx).await;
@@ -162,11 +159,17 @@ async fn ws_event_loop(
                 }
             }
             event = broadcast_rx.recv() => {
-                trace!("relaying event to client");
-                let ev_bytes = to_bytes::<_, 128>(&event).unwrap();
-                let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
-                if r.is_err() {
-                    warn!("relay error");
+                let Some(event) = event else {
+                    warn!("broadcast_rx returned None");
+                    continue
+                };
+                if event.source_addr != Some(state.remote_addr) {
+                    trace!("relaying event to {}", state.remote_addr);
+                    let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(event)).unwrap();
+                    let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
+                    if r.is_err() {
+                        warn!("relay error");
+                    }
                 }
             }
         }
@@ -180,7 +183,7 @@ async fn process_message(
     mut ws_tx: impl Sink<Message> + Unpin,
     db: &mut Db,
     state: &mut State,
-    broadcast_tx: &mut postage::broadcast::Sender<Event>,
+    broadcast_tx: &mut postage::broadcast::Sender<HotSyncEvent>,
 ) -> Result<(), Error> {
     use postage::prelude::Sink;
     match ws_message {
@@ -295,98 +298,32 @@ async fn process_message(
                 | ArchivedEvent::AlreadyCheckedOut { .. } => {
                     warn!("{}: wrong message", state.remote_addr);
                 }
-                ArchivedEvent::RecordCreated { tree, key, .. }
-                | ArchivedEvent::RecordMetaChanged { tree, key, .. }
-                | ArchivedEvent::RecordChanged { tree, key, .. }
-                | ArchivedEvent::RecordRemoved { tree, key, .. } => {
+                ArchivedEvent::HotSyncEvent(hot_sync_event) => {
                     let Some(client_info) = &state.info else {
                         error!("Record hot update ignored, because client is not registered yet");
                         return Ok(());
                     };
-                    let key = GenericKey::from_archived(key);
-                    if let ArchivedEvent::RecordCreated { .. } = client_event {
-                        if !client_info.owns_key(tree, key) {
+                    let tree_name = hot_sync_event.tree_name.as_str();
+                    let key = GenericKey::from_archived(&hot_sync_event.key);
+                    let remote_name = format!("{}", state.remote_addr);
+                    trace!("Got hot sync from {remote_name}/{tree_name}/{key}");
+                    if let ArchivedHotSyncEventKind::RecordCreated { .. } = hot_sync_event.kind {
+                        if !client_info.owns_key(tree_name, key) {
                             warn!(
                                 "{} tried to create a record with id {} it doesn't own",
-                                state.remote_addr, key
+                                remote_name, key
                             );
                             return Ok(());
                         }
                     }
-                    let remote_name = format!("{}", state.remote_addr);
-                    sync_common::handle_incoming_record(db, client_event, &remote_name)?;
-
-                    match client_event {
-                        ArchivedEvent::RecordCreated {
-                            tree,
-                            key,
-                            meta,
-                            data,
-                        } => {
-                            let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).unwrap();
-                            let mut data_copy = AlignedVec::new();
-                            data_copy.extend_from_slice(data.as_slice());
-                            broadcast_tx
-                                .send(Event::RecordCreated {
-                                    tree: tree.to_string(),
-                                    key: GenericKey::from_archived(key),
-                                    meta,
-                                    data: data_copy,
-                                })
-                                .await
-                                .map_err(|_| Error::PostageBroadcast)?;
-                        }
-                        ArchivedEvent::RecordMetaChanged {
-                            tree,
-                            key,
-                            meta,
-                            meta_iteration,
-                        } => {
-                            let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).unwrap();
-                            broadcast_tx
-                                .send(Event::RecordMetaChanged {
-                                    tree: tree.to_string(),
-                                    key: GenericKey::from_archived(key),
-                                    meta,
-                                    meta_iteration: *meta_iteration,
-                                })
-                                .await
-                                .map_err(|_| Error::PostageBroadcast)?;
-                        }
-                        ArchivedEvent::RecordChanged {
-                            tree,
-                            key,
-                            meta,
-                            meta_iteration,
-                            data,
-                            data_iteration,
-                        } => {
-                            let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).unwrap();
-                            let mut data_copy = AlignedVec::new();
-                            data_copy.extend_from_slice(data.as_slice());
-                            broadcast_tx
-                                .send(Event::RecordChanged {
-                                    tree: tree.to_string(),
-                                    key: GenericKey::from_archived(key),
-                                    meta,
-                                    meta_iteration: *meta_iteration,
-                                    data: data_copy,
-                                    data_iteration: *data_iteration,
-                                })
-                                .await
-                                .map_err(|_| Error::PostageBroadcast)?;
-                        }
-                        ArchivedEvent::RecordRemoved { tree, key } => {
-                            broadcast_tx
-                                .send(Event::RecordRemoved {
-                                    tree: tree.to_string(),
-                                    key: GenericKey::from_archived(key),
-                                })
-                                .await
-                                .map_err(|_| Error::PostageBroadcast)?;
-                        }
-                        _ => unreachable!(),
-                    }
+                    sync_common::handle_incoming_record(db, hot_sync_event, &remote_name)?;
+                    let mut hot_sync_event_owned: HotSyncEvent =
+                        hot_sync_event.deserialize(&mut rkyv::Infallible).expect("");
+                    hot_sync_event_owned.source_addr = Some(state.remote_addr);
+                    broadcast_tx
+                        .send(hot_sync_event_owned)
+                        .await
+                        .map_err(|_| Error::PostageBroadcast)?;
                 }
                 ArchivedEvent::RequestRecords { tree, keys } => {
                     send_records(db, tree.as_str(), keys, &mut ws_tx).await?;

@@ -88,11 +88,12 @@ async fn event_loop(
                             handle_result!(r);
                         }
                         Ok(None) => {
-                            break;
+                            warn!("ws_tx: None");
+                            should_disconnect = true;
                         }
                         Err(e) => {
-                            warn!("{e}");
-                            break;
+                            warn!("ws_rx: {e}");
+                            should_disconnect = true;
                         }
                     }
                 }
@@ -111,7 +112,7 @@ async fn event_loop(
                 event = event_rx.recv() => {
                     trace!("ev: {event:?}");
                     if let Some(event) = event {
-                        let r = send_hot_change(&db, event, ws_tx).await;
+                        let r = send_hot_change(&db, event, ws_tx, None).await;
                         handle_result!(r);
                     }
                 }
@@ -174,6 +175,10 @@ async fn event_loop(
                     let _ = ws.close(None).await;
                 }
             }
+
+            if let Ok(mut telem) = telem.write() {
+                telem.connected = false;
+            }
         }
     }
 }
@@ -206,11 +211,8 @@ async fn process_message(
                 }
                 ArchivedEvent::CheckedOut { .. } => {}
                 ArchivedEvent::AlreadyCheckedOut { .. } => {}
-                ArchivedEvent::RecordCreated { .. }
-                | ArchivedEvent::RecordMetaChanged { .. }
-                | ArchivedEvent::RecordChanged { .. }
-                | ArchivedEvent::RecordRemoved { .. } => {
-                    handle_incoming_record(db, ev, "server")?;
+                ArchivedEvent::HotSyncEvent(hot_sync_event) => {
+                    handle_incoming_record(db, hot_sync_event, "server")?;
                 }
                 ArchivedEvent::CheckOut { .. }
                 | ArchivedEvent::Return { .. }

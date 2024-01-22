@@ -1,10 +1,20 @@
+use crate::common::{Error, ManagedTrees};
+use crate::consts::{KEY_POOL, SELF_UUID};
+use crate::record::{Record, RecordMeta};
 use crate::sync::{
-    ArchivedEvent, ArchivedRecordIteration, ChangeKind, Event, RecordHotChange, RecordIteration,
+    ArchivedHotSyncEvent, ArchivedHotSyncEventKind, ArchivedRecordIteration, ChangeKind, Event,
+    HotSyncEvent, HotSyncEventKind, RecordHotChange, RecordIteration,
 };
 use futures_util::{Sink, SinkExt};
+use hills_base::generic_key::ArchivedGenericKey;
+use hills_base::GenericKey;
 use log::{error, trace, warn};
+use rkyv::collections::ArchivedHashMap;
+use rkyv::vec::ArchivedVec;
 use rkyv::{archived_root, to_bytes, AlignedVec, Deserialize};
 use sled::Db;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::Message;
 
 pub async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
@@ -30,11 +40,12 @@ pub async fn send_hot_change(
     db: &Db,
     change: RecordHotChange,
     ws_tx: &mut (impl Sink<Message> + Unpin),
+    source_addr: Option<SocketAddr>,
 ) -> Result<(), Error> {
     let tree = db.open_tree(change.tree.as_str())?;
     let ev = match change.kind {
         ChangeKind::Create | ChangeKind::ModifyMeta | ChangeKind::ModifyBoth => {
-            let Some(record_bytes) = tree.get(&change.key.to_bytes())? else {
+            let Some(record_bytes) = tree.get(change.key.to_bytes())? else {
                 error!(
                     "send_hot_change for {}/{}: record do not actually exist",
                     change.tree, change.key
@@ -45,45 +56,53 @@ pub async fn send_hot_change(
             let meta: RecordMeta = record.meta.deserialize(&mut rkyv::Infallible).expect("");
             match change.kind {
                 ChangeKind::Create | ChangeKind::ModifyBoth => {
-                    let mut data = AlignedVec::new();
-                    data.extend_from_slice(record.data.as_slice());
+                    let data = record.data.to_vec();
                     match change.kind {
-                        ChangeKind::Create => Event::RecordCreated {
-                            tree: change.tree,
+                        ChangeKind::Create => HotSyncEvent {
+                            tree_name: change.tree,
                             key: change.key,
-                            meta,
-                            data,
+                            source_addr,
+                            kind: HotSyncEventKind::RecordCreated { meta, data },
                         },
-                        ChangeKind::ModifyBoth => Event::RecordChanged {
-                            tree: change.tree,
+                        ChangeKind::ModifyBoth => HotSyncEvent {
+                            tree_name: change.tree,
                             key: change.key,
-                            meta,
-                            meta_iteration: record.meta_iteration,
-                            data,
-                            data_iteration: record.data_iteration,
+                            source_addr,
+                            kind: HotSyncEventKind::RecordChanged {
+                                meta,
+                                meta_iteration: record.meta_iteration,
+                                data,
+                                data_iteration: record.data_iteration,
+                            },
                         },
                         _ => unreachable!(),
                     }
                 }
-                ChangeKind::ModifyMeta => Event::RecordMetaChanged {
-                    tree: change.tree,
+                ChangeKind::ModifyMeta => HotSyncEvent {
+                    tree_name: change.tree,
                     key: change.key,
-                    meta,
-                    meta_iteration: record.meta_iteration,
+                    source_addr,
+                    kind: HotSyncEventKind::RecordMetaChanged {
+                        meta,
+                        meta_iteration: record.meta_iteration,
+                    },
                 },
                 _ => unreachable!(),
             }
         }
-        ChangeKind::Remove => Event::RecordRemoved {
-            tree: change.tree,
+        ChangeKind::Remove => HotSyncEvent {
+            tree_name: change.tree,
             key: change.key,
+            source_addr,
+            kind: HotSyncEventKind::RecordRemoved,
         },
     };
-    let ev_bytes = to_bytes::<_, 128>(&ev)?;
+    let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(ev))?;
     ws_tx
         .send(Message::Binary(ev_bytes.to_vec()))
         .await
         .map_err(|_| Error::Ws)?;
+    trace!("Sent hot change");
     Ok(())
 }
 
@@ -152,6 +171,10 @@ pub async fn compare_and_request_missing_records(
             }
         }
     }
+    trace!(
+        "{} missing or outdated: {missing_or_outdated:?}",
+        tree_name.as_ref()
+    );
     let ev = Event::RequestRecords {
         tree: tree_name.as_ref().to_string(),
         keys: missing_or_outdated,
@@ -193,38 +216,19 @@ macro_rules! handle_result {
         }
     }};
 }
-use crate::common::{Error, ManagedTrees};
-use crate::consts::{KEY_POOL, SELF_UUID};
-use crate::record::{Record, RecordMeta};
 pub use handle_result;
-use hills_base::generic_key::ArchivedGenericKey;
-use hills_base::GenericKey;
-use rkyv::collections::ArchivedHashMap;
-use rkyv::vec::ArchivedVec;
-use std::collections::HashMap;
 
 pub fn handle_incoming_record(
     db: &mut Db,
-    ev: &ArchivedEvent,
+    ev: &ArchivedHotSyncEvent,
     remote_name: &str,
 ) -> Result<(), Error> {
-    let (tree_name, key) = match ev {
-        ArchivedEvent::RecordCreated { tree, key, .. }
-        | ArchivedEvent::RecordMetaChanged { tree, key, .. }
-        | ArchivedEvent::RecordChanged { tree, key, .. }
-        | ArchivedEvent::RecordRemoved { tree, key, .. } => {
-            (tree.as_str(), GenericKey::from_archived(key))
-        }
-        _ => {
-            return Err(Error::Internal(
-                "handle_incoming_record called with incorrect event".into(),
-            ))
-        }
-    };
+    let tree_name = ev.tree_name.as_str();
+    let key = GenericKey::from_archived(&ev.key);
     let key_bytes = key.to_bytes();
     let db_tree = db.open_tree(tree_name)?;
-    match ev {
-        ArchivedEvent::RecordCreated { meta, data, .. } => {
+    match &ev.kind {
+        ArchivedHotSyncEventKind::RecordCreated { meta, data, .. } => {
             let mut new_data = AlignedVec::new();
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
             new_data.extend_from_slice(data.as_slice());
@@ -247,12 +251,12 @@ pub fn handle_incoming_record(
                 trace!("{} created record {}/{}", remote_name, tree_name, key);
             }
         }
-        ArchivedEvent::RecordMetaChanged {
+        ArchivedHotSyncEventKind::RecordMetaChanged {
             meta,
             meta_iteration,
             ..
         }
-        | ArchivedEvent::RecordChanged {
+        | ArchivedHotSyncEventKind::RecordChanged {
             meta,
             meta_iteration,
             ..
@@ -267,8 +271,8 @@ pub fn handle_incoming_record(
             let old_record = unsafe { archived_root::<Record>(&record) };
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
 
-            match ev {
-                ArchivedEvent::RecordMetaChanged { .. } => {
+            match &ev.kind {
+                ArchivedHotSyncEventKind::RecordMetaChanged { .. } => {
                     if *meta_iteration <= old_record.meta_iteration {
                         trace!(
                             "{remote_name} update meta {tree_name}/{key} ignored, because it's iteration is {meta_iteration} and this db have {}",
@@ -295,7 +299,7 @@ pub fn handle_incoming_record(
                         meta_iteration
                     );
                 }
-                ArchivedEvent::RecordChanged {
+                ArchivedHotSyncEventKind::RecordChanged {
                     data,
                     data_iteration,
                     ..
@@ -332,7 +336,7 @@ pub fn handle_incoming_record(
                 _ => unreachable!(),
             }
         }
-        ArchivedEvent::RecordRemoved { .. } => {
+        ArchivedHotSyncEventKind::RecordRemoved => {
             if db_tree.remove(key_bytes)?.is_none() {
                 warn!(
                     "{} tried to remove non-existing record: {}/{}",
@@ -341,7 +345,6 @@ pub fn handle_incoming_record(
                 return Ok(());
             }
         }
-        _ => unreachable!(),
     }
     Ok(())
 }

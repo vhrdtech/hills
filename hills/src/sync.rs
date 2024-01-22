@@ -2,6 +2,8 @@ use crate::record::RecordMeta;
 use hills_base::GenericKey;
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter};
+use std::net::SocketAddr;
 use std::ops::Range;
 
 // pub enum NodeKind {
@@ -55,32 +57,6 @@ pub enum Event {
         tree: String,
         records: HashMap<GenericKey, RecordIteration>,
     },
-
-    RecordCreated {
-        tree: String,
-        key: GenericKey,
-        meta: RecordMeta,
-        data: AlignedVec,
-    },
-    RecordMetaChanged {
-        tree: String,
-        key: GenericKey,
-        meta: RecordMeta,
-        meta_iteration: u32,
-    },
-    RecordChanged {
-        tree: String,
-        key: GenericKey,
-        meta: RecordMeta,
-        meta_iteration: u32,
-        data: AlignedVec,
-        data_iteration: u32,
-    },
-    RecordRemoved {
-        tree: String,
-        key: GenericKey,
-    },
-
     RequestRecords {
         tree: String,
         keys: Vec<GenericKey>,
@@ -90,6 +66,8 @@ pub enum Event {
         key: GenericKey,
         record: AlignedVec,
     },
+
+    HotSyncEvent(HotSyncEvent),
 
     GetKeySet {
         tree: String,
@@ -118,10 +96,65 @@ pub enum Event {
     },
 }
 
-#[derive(Archive, Clone, Debug, Serialize, Deserialize)]
+#[derive(Archive, Clone, Serialize, Deserialize)]
+pub struct HotSyncEvent {
+    pub tree_name: String,
+    pub key: GenericKey,
+    pub source_addr: Option<SocketAddr>,
+    pub kind: HotSyncEventKind,
+}
+
+#[derive(Archive, Clone, Serialize, Deserialize)]
+pub enum HotSyncEventKind {
+    RecordCreated {
+        meta: RecordMeta,
+        data: Vec<u8>,
+    },
+    RecordMetaChanged {
+        meta: RecordMeta,
+        meta_iteration: u32,
+    },
+    RecordChanged {
+        meta: RecordMeta,
+        meta_iteration: u32,
+        data: Vec<u8>,
+        data_iteration: u32,
+    },
+    RecordRemoved,
+}
+
+#[derive(Archive, Clone, Serialize, Deserialize)]
 #[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
 pub struct RecordIteration {
     pub meta_iteration: u32,
     pub data_iteration: u32,
+}
+
+impl Display for RecordIteration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "it{{m:{} d:{}}}",
+            self.meta_iteration, self.data_iteration
+        )
+    }
+}
+
+impl Debug for RecordIteration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl Debug for ArchivedRecordIteration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            RecordIteration {
+                meta_iteration: self.meta_iteration,
+                data_iteration: self.data_iteration,
+            }
+        )
+    }
 }

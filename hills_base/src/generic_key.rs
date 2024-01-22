@@ -1,5 +1,5 @@
 use rkyv::{Archive, Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 pub trait TreeKey {
     fn tree_name() -> &'static str;
@@ -7,9 +7,9 @@ pub trait TreeKey {
     fn to_generic(&self) -> GenericKey;
 }
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
-#[archive_attr(derive(Debug, Hash, PartialEq, Eq))]
+#[archive_attr(derive(Hash, PartialEq, Eq))]
 pub struct GenericKey {
     pub id: u32,
     pub revision: u32,
@@ -59,6 +59,18 @@ impl GenericKey {
 }
 
 impl Display for GenericKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.id, self.revision)
+    }
+}
+
+impl Debug for GenericKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl Debug for ArchivedGenericKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.id, self.revision)
     }
