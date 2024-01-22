@@ -1,6 +1,9 @@
 use crate::common::{Error, ManagedTrees};
 use crate::consts::SELF_UUID;
-use crate::sync::{ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, RecordHotChange};
+use crate::record::{Record, RecordMeta};
+use crate::sync::{
+    ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind, RecordHotChange,
+};
 use crate::sync_common::{
     compare_and_request_missing_records, present_self, send_records, send_tree_overviews,
 };
@@ -163,6 +166,7 @@ async fn ws_event_loop(
                     warn!("broadcast_rx returned None");
                     continue
                 };
+                // trace!("hot change from {:?} in {} event loop", event.source_addr, state.remote_addr);
                 if event.source_addr != Some(state.remote_addr) {
                     trace!("relaying event to {}", state.remote_addr);
                     let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(event)).unwrap();
@@ -307,7 +311,7 @@ async fn process_message(
                     let key = GenericKey::from_archived(&hot_sync_event.key);
                     let remote_name = format!("{}", state.remote_addr);
                     trace!("Got hot sync from {remote_name}/{tree_name}/{key}");
-                    if let ArchivedHotSyncEventKind::RecordCreated { .. } = hot_sync_event.kind {
+                    if let ArchivedHotSyncEventKind::Created { .. } = hot_sync_event.kind {
                         if !client_info.owns_key(tree_name, key) {
                             warn!(
                                 "{} tried to create a record with id {} it doesn't own",
@@ -341,6 +345,27 @@ async fn process_message(
                     } else {
                         tree.insert(key_bytes, record.as_slice())?;
                         trace!("{tree_name}/{key} inserted");
+
+                        let record = unsafe { archived_root::<Record>(record) };
+                        let meta: RecordMeta =
+                            record.meta.deserialize(&mut rkyv::Infallible).expect("");
+                        let data = record.data.to_vec();
+                        let hot_change_ev = HotSyncEvent {
+                            tree_name: tree_name.to_string(),
+                            key,
+                            source_addr: Some(state.remote_addr),
+                            kind: HotSyncEventKind::Created {
+                                meta,
+                                meta_iteration: record.meta_iteration,
+                                data,
+                                data_iteration: record.data_iteration,
+                            },
+                        };
+                        broadcast_tx
+                            .send(hot_change_ev)
+                            .await
+                            .map_err(|_| Error::PostageBroadcast)?;
+                        trace!("Relayed cold change to other connected clients");
                     }
                 }
             }

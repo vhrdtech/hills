@@ -43,7 +43,7 @@ pub async fn send_hot_change(
     source_addr: Option<SocketAddr>,
 ) -> Result<(), Error> {
     let tree = db.open_tree(change.tree.as_str())?;
-    let ev = match change.kind {
+    let hot_change_ev = match change.kind {
         ChangeKind::Create | ChangeKind::ModifyMeta | ChangeKind::ModifyBoth => {
             let Some(record_bytes) = tree.get(change.key.to_bytes())? else {
                 error!(
@@ -62,13 +62,18 @@ pub async fn send_hot_change(
                             tree_name: change.tree,
                             key: change.key,
                             source_addr,
-                            kind: HotSyncEventKind::RecordCreated { meta, data },
+                            kind: HotSyncEventKind::Created {
+                                meta,
+                                meta_iteration: 0,
+                                data,
+                                data_iteration: 0,
+                            },
                         },
                         ChangeKind::ModifyBoth => HotSyncEvent {
                             tree_name: change.tree,
                             key: change.key,
                             source_addr,
-                            kind: HotSyncEventKind::RecordChanged {
+                            kind: HotSyncEventKind::Changed {
                                 meta,
                                 meta_iteration: record.meta_iteration,
                                 data,
@@ -82,7 +87,7 @@ pub async fn send_hot_change(
                     tree_name: change.tree,
                     key: change.key,
                     source_addr,
-                    kind: HotSyncEventKind::RecordMetaChanged {
+                    kind: HotSyncEventKind::MetaChanged {
                         meta,
                         meta_iteration: record.meta_iteration,
                     },
@@ -94,10 +99,10 @@ pub async fn send_hot_change(
             tree_name: change.tree,
             key: change.key,
             source_addr,
-            kind: HotSyncEventKind::RecordRemoved,
+            kind: HotSyncEventKind::Removed,
         },
     };
-    let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(ev))?;
+    let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(hot_change_ev))?;
     ws_tx
         .send(Message::Binary(ev_bytes.to_vec()))
         .await
@@ -228,14 +233,19 @@ pub fn handle_incoming_record(
     let key_bytes = key.to_bytes();
     let db_tree = db.open_tree(tree_name)?;
     match &ev.kind {
-        ArchivedHotSyncEventKind::RecordCreated { meta, data, .. } => {
+        ArchivedHotSyncEventKind::Created {
+            meta,
+            data,
+            meta_iteration,
+            data_iteration,
+        } => {
             let mut new_data = AlignedVec::new();
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
             new_data.extend_from_slice(data.as_slice());
             let record = Record {
-                meta_iteration: 0,
+                meta_iteration: *meta_iteration,
                 meta,
-                data_iteration: 0,
+                data_iteration: *data_iteration,
                 data: new_data,
             };
             let record_bytes = to_bytes::<_, 128>(&record)?;
@@ -251,12 +261,11 @@ pub fn handle_incoming_record(
                 trace!("{} created record {}/{}", remote_name, tree_name, key);
             }
         }
-        ArchivedHotSyncEventKind::RecordMetaChanged {
+        ArchivedHotSyncEventKind::MetaChanged {
             meta,
             meta_iteration,
-            ..
         }
-        | ArchivedHotSyncEventKind::RecordChanged {
+        | ArchivedHotSyncEventKind::Changed {
             meta,
             meta_iteration,
             ..
@@ -272,7 +281,7 @@ pub fn handle_incoming_record(
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
 
             match &ev.kind {
-                ArchivedHotSyncEventKind::RecordMetaChanged { .. } => {
+                ArchivedHotSyncEventKind::MetaChanged { .. } => {
                     if *meta_iteration <= old_record.meta_iteration {
                         trace!(
                             "{remote_name} update meta {tree_name}/{key} ignored, because it's iteration is {meta_iteration} and this db have {}",
@@ -299,7 +308,7 @@ pub fn handle_incoming_record(
                         meta_iteration
                     );
                 }
-                ArchivedHotSyncEventKind::RecordChanged {
+                ArchivedHotSyncEventKind::Changed {
                     data,
                     data_iteration,
                     ..
@@ -336,7 +345,7 @@ pub fn handle_incoming_record(
                 _ => unreachable!(),
             }
         }
-        ArchivedHotSyncEventKind::RecordRemoved => {
+        ArchivedHotSyncEventKind::Removed => {
             if db_tree.remove(key_bytes)?.is_none() {
                 warn!(
                     "{} tried to remove non-existing record: {}/{}",

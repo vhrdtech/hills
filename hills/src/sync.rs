@@ -106,21 +106,24 @@ pub struct HotSyncEvent {
 
 #[derive(Archive, Clone, Serialize, Deserialize)]
 pub enum HotSyncEventKind {
-    RecordCreated {
+    Created {
         meta: RecordMeta,
+        // Might be non zero when relayed from server after doing cold sync
+        meta_iteration: u32,
         data: Vec<u8>,
+        data_iteration: u32,
     },
-    RecordMetaChanged {
+    MetaChanged {
         meta: RecordMeta,
         meta_iteration: u32,
     },
-    RecordChanged {
+    Changed {
         meta: RecordMeta,
         meta_iteration: u32,
         data: Vec<u8>,
         data_iteration: u32,
     },
-    RecordRemoved,
+    Removed,
 }
 
 #[derive(Archive, Clone, Serialize, Deserialize)]
