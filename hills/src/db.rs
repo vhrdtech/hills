@@ -204,17 +204,13 @@ impl HillsClient {
         ))
     }
 
-    pub fn open_tree<K, V>(
-        &mut self,
-        tree_name: impl AsRef<str>,
-        username: impl AsRef<str>,
-        versioning: bool,
-    ) -> Result<TreeBundle<K, V>, Error>
+    pub fn open_tree<K, V>(&mut self, username: impl AsRef<str>) -> Result<TreeBundle<K, V>, Error>
     where
         K: TreeKey,
         V: TreeRoot + Reflect,
     {
-        let tree_name = tree_name.as_ref();
+        let tree_name = <V as TreeRoot>::tree_name();
+        let versioning = <V as TreeRoot>::versioning();
         let key_tree_name = <K as TreeKey>::tree_name();
         let evolution = <V as TreeRoot>::evolution();
         if key_tree_name != tree_name {
@@ -306,11 +302,11 @@ impl HillsClient {
                     }
                     None => {
                         trace!("Create new tree {tree_name}");
-                        if evolution != SimpleVersion::new(0, 0) {
-                            return Err(Error::EvolutionMismatch(
-                                "First evolution must be 0.0".into(),
-                            ));
-                        }
+                        // if evolution != SimpleVersion::new(0, 0) {
+                        //     return Err(Error::EvolutionMismatch(
+                        //         "First evolution must be 0.0".into(),
+                        //     ));
+                        // }
                         let descriptor = TreeDescriptor {
                             evolutions: [(evolution, current_tc)].into(),
                             versioning,
@@ -438,8 +434,8 @@ where
             version: versioning,
             modified_on: self.uuid.into_bytes(),
             modified_by: self.username.clone(),
-            modified: Utc::now(),
-            created: Utc::now(),
+            modified: Utc::now().into(),
+            created: Utc::now().into(),
             rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
             evolution: <V as TreeRoot>::evolution(),
@@ -514,7 +510,7 @@ where
                 version: versioning,
                 modified_on: self.uuid.into_bytes(),
                 modified_by: self.username.clone(),
-                modified: Utc::now(),
+                modified: Utc::now().into(),
                 created: replacing
                     .meta
                     .created

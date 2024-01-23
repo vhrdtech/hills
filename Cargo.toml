@@ -9,3 +9,4 @@ members = [
 
 [workspace.dependencies]
 rkyv = { version = "0.7.42", features = ["validation", "strict"] }
+chrono = { version = "0.4", features = ["rkyv"] }

@@ -1,5 +1,4 @@
-use chrono::{DateTime, Utc};
-use hills_base::{GenericKey, SimpleVersion};
+use hills_base::{GenericKey, SimpleVersion, UtcDateTime};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
 // #[derive(Archive, Serialize, Deserialize)]
@@ -12,7 +11,7 @@ use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
 /// Tree record holding meta information, dates and data itself.
 #[derive(Archive, Serialize, Deserialize)]
-// #[archive(check_bytes)] DateTime prevents deriving this
+#[archive(check_bytes)]
 // #[archive_attr(derive(Debug))]
 pub struct Record {
     /// 0 when first created, must be incremented each time any field of a RecordMeta is modified.
@@ -28,6 +27,7 @@ pub struct Record {
 }
 
 #[derive(Archive, Clone, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct RecordMeta {
     /// Same ID as in a Record's key
     pub key: GenericKey,
@@ -41,9 +41,9 @@ pub struct RecordMeta {
     /// Node UUID
     pub modified_on: [u8; 16],
     /// Last time meta or data were changed.
-    pub modified: DateTime<Utc>,
+    pub modified: UtcDateTime,
     /// Time when Record was created.
-    pub created: DateTime<Utc>,
+    pub created: UtcDateTime,
     // Additional metadata accessible by user.
     // pub meta: Option<AlignedVec>,
     /// Rust version of the program, that serialized the data.

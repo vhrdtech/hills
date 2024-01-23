@@ -1,8 +1,10 @@
+pub mod date_time;
 pub mod evolution_check;
 pub mod generic_key;
 pub mod simple_ast;
 pub mod simple_version;
 
+pub use date_time::UtcDateTime;
 pub use evolution_check::is_backwards_compatible;
 pub use generic_key::{GenericKey, TreeKey};
 pub use simple_ast::*;
@@ -15,6 +17,7 @@ pub trait Reflect {
 pub trait TreeRoot {
     fn tree_name() -> &'static str;
     fn evolution() -> SimpleVersion;
+    fn versioning() -> bool;
 }
 
 use rkyv::with::AsBox;

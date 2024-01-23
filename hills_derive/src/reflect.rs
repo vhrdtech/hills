@@ -101,9 +101,30 @@ pub fn process_enum(non_std_types: &mut Vec<Path>, de: DataEnum) -> TokenStream 
     ts
 }
 
-const STD_TYPES: [&str; 18] = [
-    "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool",
-    "Option", "String", "Vec", "HashMap", "HashSet",
+const STD_TYPES: [&str; 23] = [
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "f32",
+    "f64",
+    "bool",
+    "Option",
+    "String",
+    "Vec",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "Variant",
+    "VariantTy",
+    "UtcDateTime",
+    "Decimal",
 ];
 
 // TODO: Handle generics

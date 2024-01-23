@@ -413,7 +413,9 @@ dependencies = [
 name = "hills_base"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rkyv",
+ "serde",
 ]
 
 [[package]]

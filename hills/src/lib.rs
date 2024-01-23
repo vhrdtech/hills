@@ -13,6 +13,6 @@ pub mod tree;
 pub use db::{HillsClient, TreeBundle};
 pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
 
-pub use hills_base::TreeKey;
+pub use hills_base::{TreeKey, UtcDateTime};
 
 // TODO: remove unwraps
