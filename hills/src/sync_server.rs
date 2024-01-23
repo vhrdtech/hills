@@ -11,7 +11,7 @@ use crate::{handle_result, sync_common};
 use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use hills_base::GenericKey;
 use log::{error, info, trace, warn};
-use rkyv::{archived_root, check_archived_root, to_bytes, Archive, Deserialize, Serialize};
+use rkyv::{check_archived_root, to_bytes, Archive, Deserialize, Serialize};
 use sled::Db;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -196,7 +196,7 @@ async fn process_message(
     use postage::prelude::Sink;
     match ws_message {
         Message::Binary(bytes) => {
-            let client_event = unsafe { archived_root::<Event>(&bytes) };
+            let client_event = check_archived_root::<Event>(&bytes)?;
             match client_event {
                 ArchivedEvent::PresentSelf { uuid } => {
                     trace!("Client presenting uuid: {uuid:x?}");
@@ -347,7 +347,7 @@ async fn process_message(
                         tree.insert(key_bytes, record.as_slice())?;
                         trace!("{tree_name}/{key} inserted");
 
-                        let record = unsafe { archived_root::<Record>(record) };
+                        let record = check_archived_root::<Record>(record)?;
                         let meta: RecordMeta =
                             record.meta.deserialize(&mut rkyv::Infallible).expect("");
                         let data = record.data.to_vec();

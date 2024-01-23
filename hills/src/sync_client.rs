@@ -14,7 +14,7 @@ use hills_base::GenericKey;
 use log::{info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::{archived_root, to_bytes};
+use rkyv::{check_archived_root, to_bytes};
 use sled::Db;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -197,7 +197,7 @@ async fn process_message(
 ) -> Result<(), Error> {
     match ws_message {
         Message::Binary(bytes) => {
-            let ev = unsafe { archived_root::<Event>(&bytes) };
+            let ev = check_archived_root::<Event>(&bytes)?;
             match ev {
                 ArchivedEvent::PresentSelf { uuid } => {
                     trace!("Server uuid is: {uuid:x?}");

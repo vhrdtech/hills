@@ -16,9 +16,7 @@ use rkyv::ser::serializers::{
 };
 use rkyv::validation::validators::{DefaultValidator, DefaultValidatorError};
 use rkyv::validation::CheckArchiveError;
-use rkyv::{
-    archived_root, check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Serialize,
-};
+use rkyv::{check_archived_root, to_bytes, Archive, CheckBytes, Deserialize, Serialize};
 use sled::transaction::{ConflictableTransactionError, TransactionError};
 use sled::{Db, Tree};
 use std::cmp::Ordering;
@@ -485,7 +483,7 @@ where
                     "Previous version of {key:?} is not in the data tree"
                 )));
             };
-            let previous_record = unsafe { archived_root::<Record>(&previous_record) };
+            let previous_record = check_archived_root::<Record>(&previous_record)?;
             if matches!(previous_record.meta.version, ArchivedVersion::Draft) {
                 return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
             }
@@ -493,7 +491,7 @@ where
         }
 
         if let Some(replacing) = self.data.get(key_bytes)? {
-            let replacing = unsafe { archived_root::<Record>(&replacing) };
+            let replacing = check_archived_root::<Record>(&replacing)?;
             if self.versioning && matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
                 return Err(Error::VersioningMismatch(format!(
                     "Cannot replace Released record {key:?}"
@@ -554,7 +552,7 @@ where
         let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
-                let archived_record = unsafe { archived_root::<Record>(&bytes) };
+                let archived_record = check_archived_root::<Record>(&bytes)?;
                 let record_evolution: SimpleVersion = archived_record
                     .meta
                     .evolution
@@ -584,7 +582,7 @@ where
         let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
-                let archived_record = unsafe { archived_root::<Record>(&bytes) };
+                let archived_record = check_archived_root::<Record>(&bytes)?;
 
                 let record_evolution: SimpleVersion = archived_record
                     .meta

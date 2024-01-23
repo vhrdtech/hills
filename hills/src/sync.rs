@@ -40,7 +40,7 @@ pub enum ChangeKind {
 
 // TODO: Switch to serde with &[u8] support to avoid copying data buffer many times?
 #[derive(Archive, Clone, Serialize, Deserialize)]
-// #[archive(check_bytes)]
+#[archive(check_bytes)]
 // #[archive_attr(derive(Debug))]
 pub enum Event {
     PresentSelf {
@@ -97,6 +97,7 @@ pub enum Event {
 }
 
 #[derive(Archive, Clone, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct HotSyncEvent {
     pub tree_name: String,
     pub key: GenericKey,
@@ -105,6 +106,7 @@ pub struct HotSyncEvent {
 }
 
 #[derive(Archive, Clone, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub enum HotSyncEventKind {
     Created {
         meta: RecordMeta,

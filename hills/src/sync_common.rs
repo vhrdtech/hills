@@ -11,7 +11,7 @@ use hills_base::GenericKey;
 use log::{error, trace, warn};
 use rkyv::collections::ArchivedHashMap;
 use rkyv::vec::ArchivedVec;
-use rkyv::{archived_root, to_bytes, AlignedVec, Deserialize};
+use rkyv::{check_archived_root, to_bytes, AlignedVec, Deserialize};
 use sled::Db;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -52,7 +52,7 @@ pub async fn send_hot_change(
                 );
                 return Ok(());
             };
-            let record = unsafe { archived_root::<Record>(&record_bytes) };
+            let record = check_archived_root::<Record>(&record_bytes)?;
             let meta: RecordMeta = record.meta.deserialize(&mut rkyv::Infallible).expect("");
             match change.kind {
                 ChangeKind::Create | ChangeKind::ModifyBoth => {
@@ -129,7 +129,7 @@ pub async fn send_tree_overviews(
                     "Malformed key in tree {tree_name}: {key_bytes:?}".into(),
                 ));
             };
-            let record = unsafe { archived_root::<Record>(&record_bytes) };
+            let record = check_archived_root::<Record>(&record_bytes)?;
             records.insert(
                 key,
                 RecordIteration {
@@ -164,7 +164,7 @@ pub async fn compare_and_request_missing_records(
         let key_bytes = key.to_bytes();
         match tree.get(key_bytes)? {
             Some(record) => {
-                let record = unsafe { archived_root::<Record>(&record) };
+                let record = check_archived_root::<Record>(&record)?;
                 if record.data_iteration < remote_record.data_iteration
                     || record.meta_iteration < remote_record.meta_iteration
                 {
@@ -277,7 +277,7 @@ pub fn handle_incoming_record(
                 );
                 return Ok(());
             };
-            let old_record = unsafe { archived_root::<Record>(&record) };
+            let old_record = check_archived_root::<Record>(&record)?;
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
 
             match &ev.kind {
