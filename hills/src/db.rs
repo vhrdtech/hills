@@ -8,7 +8,7 @@ use crate::sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbSyncHandl
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::{VhrdDbCmdTx, VhrdDbTelem};
 use chrono::Utc;
-use hills_base::{GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
+use hills_base::{Evolving, GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
 use log::{info, trace, warn};
 use postage::prelude::Sink;
 use rkyv::ser::serializers::{
@@ -27,14 +27,13 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::net::IpAddr;
-use std::ops::Range;
 use std::path::Path;
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-pub struct VhrdDbClient {
+pub struct HillsClient {
     db: Db,
     self_uuid: Uuid,
     descriptors: Tree,
@@ -159,11 +158,11 @@ impl From<CommonError> for Error {
     }
 }
 
-impl VhrdDbClient {
+impl HillsClient {
     pub fn open<P: AsRef<Path>>(
         path: P,
         rt: &Runtime,
-    ) -> Result<(VhrdDbClient, JoinHandle<()>), Error> {
+    ) -> Result<(HillsClient, JoinHandle<()>), Error> {
         #[cfg(not(test))]
         let db = sled::open(path)?;
         #[cfg(test)]
@@ -192,7 +191,7 @@ impl VhrdDbClient {
         let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
         let (cmd_tx, telem, syncer_join) = sync_handle.start(rt);
         Ok((
-            VhrdDbClient {
+            HillsClient {
                 db,
                 self_uuid,
                 descriptors,
@@ -316,9 +315,15 @@ impl VhrdDbClient {
                             evolutions: [(evolution, current_tc)].into(),
                             versioning,
                         };
-                        let descriptor_bytes = rkyv::to_bytes::<_, 1024>(&descriptor)?;
+                        let descriptor_bytes = to_bytes::<_, 1024>(&descriptor)?;
                         self.descriptors
                             .insert(tree_name.as_bytes(), descriptor_bytes.as_slice())?;
+                        let r = self
+                            .cmd_tx
+                            .blocking_send(SyncClientCommand::TreeCreated(tree_name.to_string()));
+                        if r.is_err() {
+                            warn!("db: TreeCreated send failed");
+                        }
                     }
                 }
                 let data = self.db.open_tree(tree_name.as_bytes())?;
@@ -379,10 +384,9 @@ where
     <V as Archive>::Archived:
         Deserialize<V, rkyv::Infallible> + for<'a> CheckBytes<DefaultValidator<'a>>,
 {
-    // TODO: should not be pub
-    pub fn feed_key_pool(&mut self, additional_range: Range<u32>) -> Result<(), Error> {
-        KeyPool::feed_for(&self.data, additional_range).map_err(Error::Internal)
-    }
+    // pub fn feed_key_pool(&mut self, additional_range: Range<u32>) -> Result<(), Error> {
+    //     KeyPool::feed_for(&self.data, additional_range).map_err(Error::Internal)
+    // }
 
     pub fn key_pool_stats(&self) -> Result<u32, Error> {
         Ok(KeyPool::stats_for(&self.data)?)
@@ -423,7 +427,7 @@ where
         if self.data.contains_key(key_bytes)? {
             return Err(Error::Internal("Duplicate key from KeyPool".to_string()));
         }
-        let data = to_bytes::<_, 128>(&value)?;
+        let data = to_bytes::<_, 128>(&Evolving(value))?;
         let versioning = if self.versioning {
             Version::Draft
         } else {
@@ -447,8 +451,8 @@ where
             data,
         };
         let record = to_bytes::<_, 128>(&record)?;
-        self.data.insert(&key_bytes, &*record)?;
-        self.latest_revision_index.insert(&key_bytes, &[])?;
+        self.data.insert(key_bytes, &*record)?;
+        self.latest_revision_index.insert(key_bytes, &[])?;
 
         let change = RecordHotChange {
             tree: self.tree_name.clone(),
@@ -494,14 +498,12 @@ where
 
         if let Some(replacing) = self.data.get(key_bytes)? {
             let replacing = unsafe { archived_root::<Record>(&replacing) };
-            if self.versioning {
-                if matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
-                    return Err(Error::VersioningMismatch(format!(
-                        "Cannot replace Released record {key:?}"
-                    )));
-                }
+            if self.versioning && matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
+                return Err(Error::VersioningMismatch(format!(
+                    "Cannot replace Released record {key:?}"
+                )));
             }
-            let data = to_bytes::<_, 128>(&value)?;
+            let data = to_bytes::<_, 128>(&Evolving(value))?;
             let versioning = if self.versioning {
                 Version::Draft
             } else {
@@ -529,8 +531,8 @@ where
                 data,
             };
             let record_bytes = to_bytes::<_, 128>(&record)?;
-            self.data.insert(&key_bytes, &*record_bytes)?;
-            self.latest_revision_index.insert(&key_bytes, &[])?;
+            self.data.insert(key_bytes, &*record_bytes)?;
+            self.latest_revision_index.insert(key_bytes, &[])?;
 
             let change = RecordHotChange {
                 tree: self.tree_name.clone(),
@@ -557,10 +559,21 @@ where
         match value {
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };
+                let record_evolution: SimpleVersion = archived_record
+                    .meta
+                    .evolution
+                    .deserialize(&mut rkyv::Infallible)
+                    .expect("");
+                if record_evolution != V::evolution() {
+                    return Err(Error::EvolutionMismatch(format!(
+                        "record evolution is {record_evolution} and code is {}",
+                        V::evolution()
+                    )));
+                }
 
-                let archived_data = check_archived_root::<V>(&archived_record.data)?;
-                let deserialized: V = archived_data.deserialize(&mut rkyv::Infallible)?;
-                Ok(Some(deserialized))
+                let archived_data = check_archived_root::<Evolving<V>>(&archived_record.data)?;
+                let deserialized: Evolving<V> = archived_data.deserialize(&mut rkyv::Infallible)?;
+                Ok(Some(deserialized.0))
             }
             None => Ok(None),
         }
@@ -576,8 +589,21 @@ where
         match value {
             Some(bytes) => {
                 let archived_record = unsafe { archived_root::<Record>(&bytes) };
-                let archived_data = check_archived_root::<V>(&archived_record.data)?;
-                Ok(f(Some(archived_data)))
+
+                let record_evolution: SimpleVersion = archived_record
+                    .meta
+                    .evolution
+                    .deserialize(&mut rkyv::Infallible)
+                    .expect("");
+                if record_evolution != V::evolution() {
+                    return Err(Error::EvolutionMismatch(format!(
+                        "record evolution is {record_evolution} and code is {}",
+                        V::evolution()
+                    )));
+                }
+
+                let archived_data = check_archived_root::<Evolving<V>>(&archived_record.data)?;
+                Ok(f(Some(archived_data.0.get())))
             }
             None => Ok(f(None)),
         }

@@ -234,7 +234,7 @@ async fn process_message(
                     compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
                 }
                 ArchivedEvent::GetKeySet { tree } => {
-                    let key_count = 10;
+                    let key_count = 1000;
                     trace!("{}: GetKeySet for {tree}", state.remote_addr);
                     let Some(client_info) = &mut state.info else {
                         return Ok(());

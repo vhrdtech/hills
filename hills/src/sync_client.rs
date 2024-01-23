@@ -47,6 +47,7 @@ impl VhrdDbSyncHandle {
 pub enum SyncClientCommand {
     Connect(IpAddr, u16),
     Disconnect,
+    TreeCreated(String),
     // FullReSync,
 }
 
@@ -107,6 +108,10 @@ async fn event_loop(
                             should_disconnect = true;
                         }
                         SyncClientCommand::Connect(..) => {}
+                        SyncClientCommand::TreeCreated(_tree_name) => {
+                            let r = request_keys(&db, ws_tx).await;
+                            handle_result!(r);
+                        }
                     }
                 }
                 event = event_rx.recv() => {
@@ -155,6 +160,8 @@ async fn event_loop(
                             ws_txrx = Some((ws_tx, ws_rx));
                         }
                         SyncClientCommand::Disconnect => {}
+                        SyncClientCommand::TreeCreated(_tree_name) => {
+                        }
                     }
                 }
                 event = event_rx.recv() => {

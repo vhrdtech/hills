@@ -16,3 +16,13 @@ pub trait TreeRoot {
     fn tree_name() -> &'static str;
     fn evolution() -> SimpleVersion;
 }
+
+use rkyv::with::AsBox;
+use rkyv::{Archive, Deserialize, Serialize};
+
+/// This wrapper type serializes the contained value out-of-line so that newer
+/// versions can be viewed as the older version.
+#[derive(Archive, Deserialize, Serialize)]
+#[repr(transparent)]
+#[archive(check_bytes)]
+pub struct Evolving<T>(#[with(AsBox)] pub T);
