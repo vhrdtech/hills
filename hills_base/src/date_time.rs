@@ -1,7 +1,19 @@
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use rkyv::{Archive, Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 
-#[derive(Archive, Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Archive,
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub struct UtcDateTime {
@@ -25,7 +37,7 @@ impl From<DateTime<Utc>> for UtcDateTime {
             hour: time.hour(),
             min: time.minute(),
             secs: time.second(),
-            milli: time.nanosecond() / 1000,
+            milli: time.nanosecond() / 1_000_000,
         }
     }
 }
@@ -39,5 +51,12 @@ impl From<UtcDateTime> for DateTime<Utc> {
         } else {
             DateTime::default()
         }
+    }
+}
+
+impl Display for UtcDateTime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let dt: DateTime<Utc> = (*self).into();
+        write!(f, "{}", dt)
     }
 }
