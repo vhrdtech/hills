@@ -97,6 +97,7 @@ impl HillsServer {
 async fn ws_server_acceptor(listener: TcpListener, db: Db) {
     info!("Server event loop started");
     let (broadcast_tx, broadcast_rx) = postage::broadcast::channel(256);
+    drop(broadcast_rx);
     loop {
         match listener.accept().await {
             Ok((tcp_stream, remote_addr)) => {
@@ -116,7 +117,7 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
                     remote_addr,
                     info: None,
                 };
-                let rx = broadcast_rx.clone();
+                let rx = broadcast_tx.subscribe();
                 let tx = broadcast_tx.clone();
                 tokio::spawn(async move {
                     ws_event_loop(ws_sink, ws_source, db_clone, state, rx, tx).await
