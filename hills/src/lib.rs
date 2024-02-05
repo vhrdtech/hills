@@ -3,6 +3,7 @@ mod consts;
 pub mod db;
 mod journal;
 mod key_pool;
+pub mod opaque;
 pub mod record;
 mod sync;
 pub mod sync_client;
@@ -13,6 +14,6 @@ pub mod tree;
 pub use db::{HillsClient, TreeBundle};
 pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
 
-pub use hills_base::{TreeKey, UtcDateTime};
+pub use hills_base::{GenericKey, TreeKey, UtcDateTime};
 
 // TODO: remove unwraps

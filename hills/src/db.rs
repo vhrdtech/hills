@@ -26,6 +26,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -53,11 +54,11 @@ struct RawTreeBundle {
 #[derive(Clone)]
 pub struct TreeBundle<K, V> {
     /// Key -> Record tree
-    data: Tree,
+    pub(crate) data: Tree,
     /// Monotonic index -> Key for all the latest revisions
-    latest_revision_index: Tree,
+    pub(crate) latest_revision_index: Tree,
 
-    tree_name: String,
+    pub(crate) tree_name: Arc<String>,
     uuid: Uuid,
     username: String,
     versioning: bool,
@@ -109,6 +110,9 @@ pub enum Error {
 
     #[error("Mpsc send failed")]
     Mpsc,
+
+    #[error("Provided key is not in the tree")]
+    RecordNotFound,
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -233,7 +237,7 @@ impl HillsClient {
                 latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
                 versioning: raw_tree.versioning,
-                tree_name: tree_name.to_string(),
+                tree_name: Arc::new(tree_name.to_string()),
                 event_tx: self.event_tx.clone(),
                 uuid: self.self_uuid,
 
@@ -337,7 +341,7 @@ impl HillsClient {
                     latest_revision_index: bundle.latest_revision_index,
                     username: username.as_ref().to_string(),
                     versioning,
-                    tree_name: tree_name.to_string(),
+                    tree_name: Arc::new(tree_name.to_string()),
                     event_tx: self.event_tx.clone(),
                     uuid: self.self_uuid,
 
@@ -386,7 +390,7 @@ where
         Ok(KeyPool::stats_for(&self.data)?)
     }
 
-    fn get_next_key(&mut self) -> Result<u32, Error> {
+    fn pool_get_key(&mut self) -> Result<GenericKey, Error> {
         self.data.transaction(|tx_db| match tx_db.get(KEY_POOL)? {
             Some(key_pool) => {
                 // let key_pool: &ArchivedKeyPool = unsafe { archived_root::<KeyPool>(&key_pool) };
@@ -401,6 +405,7 @@ where
                         let key_pool = to_bytes::<_, 8>(&key_pool)
                             .map_err(|_| ConflictableTransactionError::Abort("to_bytes"))?;
                         tx_db.insert(KEY_POOL, &*key_pool)?;
+                        let next_key = GenericKey::new(next_key, 0);
                         next_key
                     }
                     None => {
@@ -414,8 +419,7 @@ where
     }
 
     pub fn insert(&mut self, value: V) -> Result<K, Error> {
-        let key = self.get_next_key()?;
-        let key = GenericKey::new(key, 0);
+        let key = self.pool_get_key()?;
         let key_bytes = key.to_bytes();
 
         if self.data.contains_key(key_bytes)? {
@@ -449,7 +453,7 @@ where
         self.latest_revision_index.insert(key_bytes, &[])?;
 
         let change = RecordHotChange {
-            tree: self.tree_name.clone(),
+            tree: String::from(self.tree_name.as_str()),
             key,
             kind: ChangeKind::Create,
             data_iteration: 0,
@@ -462,7 +466,7 @@ where
         Ok(K::from_generic(key))
     }
 
-    pub fn update(&mut self, key: K, value: V) -> Result<K, Error> {
+    pub fn update(&mut self, key: K, value: V) -> Result<(), Error> {
         let generic_key = key.to_generic();
         let key_bytes = generic_key.to_bytes();
 
@@ -529,7 +533,7 @@ where
             self.latest_revision_index.insert(key_bytes, &[])?;
 
             let change = RecordHotChange {
-                tree: self.tree_name.clone(),
+                tree: String::from(self.tree_name.as_str()),
                 key: generic_key,
                 meta_iteration: record.meta_iteration,
                 data_iteration: record.data_iteration,
@@ -539,7 +543,7 @@ where
                 .blocking_send(change)
                 .map_err(|_| Error::Mpsc)?;
 
-            Ok(K::from_generic(generic_key))
+            Ok(())
         } else {
             Err(Error::Usage(format!(
                 "update {key:?}, not found, create record first"
@@ -547,7 +551,7 @@ where
         }
     }
 
-    pub fn get(&self, key: K) -> Result<Option<V>, Error> {
+    pub fn get(&self, key: K) -> Result<V, Error> {
         let key_bytes = key.to_generic().to_bytes();
         let value = self.data.get(key_bytes)?;
         match value {
@@ -567,9 +571,9 @@ where
 
                 let archived_data = check_archived_root::<Evolving<V>>(&archived_record.data)?;
                 let deserialized: Evolving<V> = archived_data.deserialize(&mut rkyv::Infallible)?;
-                Ok(Some(deserialized.0))
+                Ok(deserialized.0)
             }
-            None => Ok(None),
+            None => Err(Error::RecordNotFound),
         }
     }
 
@@ -603,9 +607,51 @@ where
         }
     }
 
+    pub fn remove(&mut self, key: K) -> Result<Option<()>, Error> {
+        let key_bytes = key.to_generic().to_bytes();
+        let value = self.data.get(key_bytes)?;
+        match value {
+            Some(bytes) => {
+                let archived_record = check_archived_root::<Record>(&bytes)?;
+                if matches!(archived_record.meta.version, ArchivedVersion::Released(_)) {
+                    return Err(Error::Usage(format!(
+                        "Cannot remove released record {}/{}",
+                        self.tree_name,
+                        key.to_generic()
+                    )));
+                }
+                self.data.remove(key_bytes)?;
+
+                Ok(Some(()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn meta(&self, key: K) -> Result<Option<(u32, RecordMeta, u32)>, Error> {
+        let key_bytes = key.to_generic().to_bytes();
+        let value = self.data.get(key_bytes)?;
+        match value {
+            Some(bytes) => {
+                let archived_record = check_archived_root::<Record>(&bytes)?;
+                let meta: RecordMeta = archived_record.meta.deserialize(&mut rkyv::Infallible)?;
+
+                Ok(Some((
+                    archived_record.meta_iteration,
+                    meta,
+                    archived_record.data_iteration,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn latest_revisions(&self) -> impl Iterator<Item = K> {
         self.latest_revision_index.iter().keys().filter_map(|key| {
             if let Ok(key) = key {
+                if key == KEY_POOL {
+                    return None;
+                }
                 let key = GenericKey::from_bytes(&key)?;
                 let key = K::from_generic(key);
                 Some(key)
