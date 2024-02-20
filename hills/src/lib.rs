@@ -1,6 +1,7 @@
 mod common;
 mod consts;
 pub mod db;
+pub mod index;
 mod journal;
 mod key_pool;
 pub mod opaque;
@@ -11,7 +12,7 @@ mod sync_common;
 pub mod sync_server;
 pub mod tree;
 
-pub use db::{HillsClient, TreeBundle};
+pub use db::{HillsClient, TypedTree};
 pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
 
 pub use hills_base::{GenericKey, TreeKey, UtcDateTime};

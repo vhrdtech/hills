@@ -1,5 +1,6 @@
 use crate::common::ManagedTrees;
 use crate::consts::{KEY_POOL, SELF_UUID};
+use crate::index::{TreeIndex, TypeErasedTree};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
@@ -49,10 +50,11 @@ struct RawTreeBundle {
     /// All latest revisions -> ()
     latest_revision_index: Tree,
     versioning: bool,
+    indexers: Vec<Box<dyn TreeIndex>>,
 }
 
 #[derive(Clone)]
-pub struct TreeBundle<K, V> {
+pub struct TypedTree<K, V> {
     /// Key -> Record tree
     pub(crate) data: Tree,
     /// Monotonic index -> Key for all the latest revisions
@@ -64,6 +66,8 @@ pub struct TreeBundle<K, V> {
     versioning: bool,
 
     event_tx: postage::mpsc::Sender<RecordHotChange>,
+
+    indexers: Vec<Box<dyn TreeIndex>>,
 
     _phantom_k: PhantomData<K>,
     _phantom_v: PhantomData<V>,
@@ -113,6 +117,9 @@ pub enum Error {
 
     #[error("Provided key is not in the tree")]
     RecordNotFound,
+
+    #[error("Indexer rejected a record: {}", .0)]
+    IndexReject(String),
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -206,33 +213,18 @@ impl HillsClient {
         ))
     }
 
-    pub fn open_tree<K, V>(&mut self, username: impl AsRef<str>) -> Result<TreeBundle<K, V>, Error>
+    pub fn open_tree<K, V>(&mut self, username: impl AsRef<str>) -> Result<TypedTree<K, V>, Error>
     where
         K: TreeKey,
         V: TreeRoot + Reflect,
     {
         let tree_name = <V as TreeRoot>::tree_name();
         let versioning = <V as TreeRoot>::versioning();
-        let key_tree_name = <K as TreeKey>::tree_name();
-        let evolution = <V as TreeRoot>::evolution();
-        if key_tree_name != tree_name {
-            return Err(Error::WrongKey(
-                key_tree_name.to_string(),
-                tree_name.to_string(),
-            ));
-        }
-        let value_tree_name = <V as TreeRoot>::tree_name();
-        if value_tree_name != tree_name {
-            return Err(Error::WrongKey(
-                key_tree_name.to_string(),
-                tree_name.to_string(),
-            ));
-        }
 
         ManagedTrees::add_to_managed(&self.db, tree_name)?;
 
         match self.open_trees.get(tree_name) {
-            Some(raw_tree) => Ok(TreeBundle {
+            Some(raw_tree) => Ok(TypedTree {
                 data: raw_tree.data.clone(),
                 latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
@@ -240,116 +232,160 @@ impl HillsClient {
                 tree_name: Arc::new(tree_name.to_string()),
                 event_tx: self.event_tx.clone(),
                 uuid: self.self_uuid,
+                indexers: Vec::new(),
 
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
             }),
             None => {
-                let mut current_tc = TypeCollection::new();
-                V::reflect(&mut current_tc);
-                match self.descriptors.get(tree_name.as_bytes())? {
-                    Some(descriptor_bytes) => {
-                        let descriptor: &ArchivedTreeDescriptor =
-                            check_archived_root::<TreeDescriptor>(&descriptor_bytes)?;
-                        let max_evolution = descriptor
-                            .evolutions
-                            .keys()
-                            .map(|k| k.as_original())
-                            .max()
-                            .unwrap_or(SimpleVersion::new(0, 0));
-                        trace!(
-                            "Checking existing tree '{tree_name}' with latest evolution: {}",
-                            max_evolution
-                        );
-                        if versioning != descriptor.versioning {
-                            return Err(Error::VersioningMismatch(
-                                "Cannot change versioning of a tree after creation".to_owned(),
-                            ));
-                        }
-                        // if evolution < current_evolution {
-                        //     return Err(Error::EvolutionMismatch("Code evolution is older than database already have".into()));
-                        // }
-                        // TODO: register new evolution
-                        match evolution.cmp(&max_evolution) {
-                            Ordering::Less => {
-                                trace!(
-                                    "Opening in backwards compatible mode, code is {}",
-                                    evolution
-                                );
-                            }
-                            Ordering::Equal => {
-                                match descriptor.evolutions.get(&evolution.as_archived()) {
-                                    Some(known_evolution) => {
-                                        let known_tc: TypeCollection =
-                                            known_evolution.deserialize(&mut rkyv::Infallible)?;
-                                        if current_tc != known_tc {
-                                            return Err(Error::EvolutionMismatch("Type definitions changed compared to what's in the database".into()));
-                                        }
-                                        trace!("Type definitions matches exactly");
-                                    }
-                                    None => {
-                                        warn!(
-                                        "Didn't found {evolution} in the database tree descriptor"
-                                    );
-                                    }
-                                }
-                            }
-                            Ordering::Greater => {
-                                info!("Will need to evolve {} to {}", max_evolution, evolution);
-                                let mut descriptor: TreeDescriptor =
-                                    descriptor.deserialize(&mut rkyv::Infallible)?;
-                                descriptor.evolutions.insert(evolution, current_tc);
-                            }
-                        }
-                    }
-                    None => {
-                        trace!("Create new tree {tree_name}");
-                        // if evolution != SimpleVersion::new(0, 0) {
-                        //     return Err(Error::EvolutionMismatch(
-                        //         "First evolution must be 0.0".into(),
-                        //     ));
-                        // }
-                        let descriptor = TreeDescriptor {
-                            evolutions: [(evolution, current_tc)].into(),
-                            versioning,
-                        };
-                        let descriptor_bytes = to_bytes::<_, 1024>(&descriptor)?;
-                        self.descriptors
-                            .insert(tree_name.as_bytes(), descriptor_bytes.as_slice())?;
-                        let r = self
-                            .cmd_tx
-                            .blocking_send(SyncClientCommand::TreeCreated(tree_name.to_string()));
-                        if r.is_err() {
-                            warn!("db: TreeCreated send failed");
-                        }
-                    }
-                }
-                let data = self.db.open_tree(tree_name.as_bytes())?;
-                let latest_revision_index = self
-                    .db
-                    .open_tree(format!("{tree_name}_latest_revision_index").as_bytes())?;
-
-                let bundle = RawTreeBundle {
-                    data,
-                    latest_revision_index,
-                    versioning,
+                self.open_cold_tree::<K, V>()?;
+                let Some(bundle) = self.open_trees.get(tree_name) else {
+                    return Err(Error::Internal("open_cold_tree failed".to_string()));
                 };
-                self.open_trees
-                    .insert(tree_name.to_string(), bundle.clone());
-                Ok(TreeBundle {
-                    data: bundle.data,
-                    latest_revision_index: bundle.latest_revision_index,
+                Ok(TypedTree {
+                    data: bundle.data.clone(),
+                    latest_revision_index: bundle.latest_revision_index.clone(),
                     username: username.as_ref().to_string(),
                     versioning,
                     tree_name: Arc::new(tree_name.to_string()),
                     event_tx: self.event_tx.clone(),
                     uuid: self.self_uuid,
+                    indexers: Vec::new(),
 
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
                 })
             }
         }
+    }
+
+    pub fn add_indexer<K, V>(&mut self, mut indexer: Box<dyn TreeIndex>) -> Result<(), Error>
+    where
+        K: TreeKey,
+        V: TreeRoot + Reflect,
+    {
+        self.open_cold_tree::<K, V>()?;
+        let tree_name = <V as TreeRoot>::tree_name();
+        let evolution = <V as TreeRoot>::evolution();
+        let Some(bundle) = self.open_trees.get_mut(tree_name) else {
+            return Err(Error::Internal("open_cold_tree failed".to_string()));
+        };
+        indexer.rebuild(TypeErasedTree {
+            tree: &mut bundle.data,
+            evolution,
+        })?;
+        bundle.indexers.push(indexer);
+        Ok(())
+    }
+
+    fn open_cold_tree<K, V>(&mut self) -> Result<(), Error>
+    where
+        K: TreeKey,
+        V: TreeRoot + Reflect,
+    {
+        let key_tree_name = <K as TreeKey>::tree_name();
+        let tree_name = <V as TreeRoot>::tree_name();
+        if key_tree_name != tree_name {
+            return Err(Error::WrongKey(
+                key_tree_name.to_string(),
+                tree_name.to_string(),
+            ));
+        }
+
+        let versioning = <V as TreeRoot>::versioning();
+        let mut current_tc = TypeCollection::new();
+        let evolution = <V as TreeRoot>::evolution();
+        V::reflect(&mut current_tc);
+
+        match self.descriptors.get(tree_name.as_bytes())? {
+            Some(descriptor_bytes) => {
+                let descriptor: &ArchivedTreeDescriptor =
+                    check_archived_root::<TreeDescriptor>(&descriptor_bytes)?;
+                let max_evolution = descriptor
+                    .evolutions
+                    .keys()
+                    .map(|k| k.as_original())
+                    .max()
+                    .unwrap_or(SimpleVersion::new(0, 0));
+                trace!(
+                    "Checking existing tree '{tree_name}' with latest evolution: {}",
+                    max_evolution
+                );
+                if versioning != descriptor.versioning {
+                    return Err(Error::VersioningMismatch(
+                        "Cannot change versioning of a tree after creation".to_owned(),
+                    ));
+                }
+                // if evolution < current_evolution {
+                //     return Err(Error::EvolutionMismatch("Code evolution is older than database already have".into()));
+                // }
+                // TODO: register new evolution
+                match evolution.cmp(&max_evolution) {
+                    Ordering::Less => {
+                        trace!(
+                            "Opening in backwards compatible mode, code is {}",
+                            evolution
+                        );
+                    }
+                    Ordering::Equal => {
+                        match descriptor.evolutions.get(&evolution.as_archived()) {
+                            Some(known_evolution) => {
+                                let known_tc: TypeCollection =
+                                    known_evolution.deserialize(&mut rkyv::Infallible)?;
+                                if current_tc != known_tc {
+                                    return Err(Error::EvolutionMismatch("Type definitions changed compared to what's in the database".into()));
+                                }
+                                trace!("Type definitions matches exactly");
+                            }
+                            None => {
+                                warn!("Didn't found {evolution} in the database tree descriptor");
+                            }
+                        }
+                    }
+                    Ordering::Greater => {
+                        info!("Will need to evolve {} to {}", max_evolution, evolution);
+                        let mut descriptor: TreeDescriptor =
+                            descriptor.deserialize(&mut rkyv::Infallible)?;
+                        descriptor.evolutions.insert(evolution, current_tc);
+                    }
+                }
+            }
+            None => {
+                trace!("Create new tree {tree_name}");
+                // if evolution != SimpleVersion::new(0, 0) {
+                //     return Err(Error::EvolutionMismatch(
+                //         "First evolution must be 0.0".into(),
+                //     ));
+                // }
+                let descriptor = TreeDescriptor {
+                    evolutions: [(evolution, current_tc)].into(),
+                    versioning,
+                };
+                let descriptor_bytes = to_bytes::<_, 1024>(&descriptor)?;
+                self.descriptors
+                    .insert(tree_name.as_bytes(), descriptor_bytes.as_slice())?;
+                let r = self
+                    .cmd_tx
+                    .blocking_send(SyncClientCommand::TreeCreated(tree_name.to_string()));
+                if r.is_err() {
+                    warn!("db: TreeCreated send failed");
+                }
+            }
+        }
+        let data = self.db.open_tree(tree_name.as_bytes())?;
+        let latest_revision_index = self
+            .db
+            .open_tree(format!("{tree_name}_latest_revision_index").as_bytes())?;
+
+        let bundle = RawTreeBundle {
+            data,
+            latest_revision_index,
+            versioning,
+            indexers: Vec::new(),
+        };
+        self.open_trees
+            .insert(tree_name.to_string(), bundle.clone());
+        Ok(())
     }
 
     pub fn connect(&mut self, ip_addr: IpAddr, port: u16) {
@@ -375,7 +411,7 @@ impl HillsClient {
     }
 }
 
-impl<K, V> TreeBundle<K, V>
+impl<K, V> TypedTree<K, V>
 where
     K: TreeKey + Debug,
     V: TreeRoot + Archive + Serialize<AllocSerializer<128>>,
@@ -419,20 +455,33 @@ where
     }
 
     pub fn insert(&mut self, value: V) -> Result<K, Error> {
-        let key = self.pool_get_key()?;
-        let key_bytes = key.to_bytes();
+        let generic_key = self.pool_get_key()?;
+        let key_bytes = generic_key.to_bytes();
+        let evolution = <V as TreeRoot>::evolution();
 
         if self.data.contains_key(key_bytes)? {
             return Err(Error::Internal("Duplicate key from KeyPool".to_string()));
         }
         let data = to_bytes::<_, 128>(&Evolving(value))?;
+        for indexer in &mut self.indexers {
+            indexer.update(
+                TypeErasedTree {
+                    tree: &mut self.data,
+                    evolution,
+                },
+                generic_key,
+                &data,
+                crate::index::Action::Insert,
+            )?;
+        }
+
         let versioning = if self.versioning {
             Version::Draft
         } else {
             Version::NonVersioned
         };
         let meta = RecordMeta {
-            key,
+            key: generic_key,
             version: versioning,
             modified_on: self.uuid.into_bytes(),
             modified_by: self.username.clone(),
@@ -440,7 +489,7 @@ where
             created: Utc::now().into(),
             rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
-            evolution: <V as TreeRoot>::evolution(),
+            evolution,
         };
         let record = Record {
             meta_iteration: 0,
@@ -454,7 +503,7 @@ where
 
         let change = RecordHotChange {
             tree: String::from(self.tree_name.as_str()),
-            key,
+            key: generic_key,
             kind: ChangeKind::Create,
             data_iteration: 0,
             meta_iteration: 0,
@@ -463,12 +512,13 @@ where
             .blocking_send(change)
             .map_err(|_| Error::Mpsc)?;
 
-        Ok(K::from_generic(key))
+        Ok(K::from_generic(generic_key))
     }
 
     pub fn update(&mut self, key: K, value: V) -> Result<(), Error> {
         let generic_key = key.to_generic();
         let key_bytes = generic_key.to_bytes();
+        let evolution = <V as TreeRoot>::evolution();
 
         if !self.versioning && generic_key.revision != 0 {
             return Err(Error::Usage(format!(
@@ -502,6 +552,18 @@ where
                 )));
             }
             let data = to_bytes::<_, 128>(&Evolving(value))?;
+            for indexer in &mut self.indexers {
+                indexer.update(
+                    TypeErasedTree {
+                        tree: &mut self.data,
+                        evolution,
+                    },
+                    generic_key,
+                    &data,
+                    crate::index::Action::Update,
+                )?;
+            }
+
             let versioning = if self.versioning {
                 Version::Draft
             } else {
@@ -520,7 +582,7 @@ where
                     .expect(""),
                 rust_version: SimpleVersion::rust_version(),
                 rkyv_version: SimpleVersion::rkyv_version(),
-                evolution: <V as TreeRoot>::evolution(),
+                evolution,
             };
             let record = Record {
                 meta_iteration: replacing.meta_iteration + 1,
@@ -608,7 +670,8 @@ where
     }
 
     pub fn remove(&mut self, key: K) -> Result<Option<()>, Error> {
-        let key_bytes = key.to_generic().to_bytes();
+        let generic_key = key.to_generic();
+        let key_bytes = generic_key.to_bytes();
         let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
@@ -619,6 +682,23 @@ where
                         self.tree_name,
                         key.to_generic()
                     )));
+                }
+                for indexer in &mut self.indexers {
+                    let r = indexer.update(
+                        TypeErasedTree {
+                            tree: &mut self.data,
+                            evolution: <V as TreeRoot>::evolution(),
+                        },
+                        generic_key,
+                        &archived_record.data,
+                        crate::index::Action::Remove,
+                    );
+                    if r.is_err() {
+                        log::error!(
+                            "Indexer for {} failed at deleting with key {generic_key}",
+                            self.tree_name
+                        );
+                    }
                 }
                 self.data.remove(key_bytes)?;
 

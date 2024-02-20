@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn empty() {
-        let mut pool = KeyPool { ranges: vec![] };
+        let mut pool = KeyPool {
+            ranges: vec![],
+            _dummy22: [0; 6],
+        };
         assert_eq!(pool.get(), None);
     }
 
@@ -94,6 +97,7 @@ mod tests {
     fn several_ranges() {
         let mut pool = KeyPool {
             ranges: vec![(0..2), (10..11)],
+            _dummy22: [0; 6],
         };
         assert_eq!(pool.get(), Some(0));
         assert_eq!(pool.get(), Some(1));

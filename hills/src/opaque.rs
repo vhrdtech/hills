@@ -1,7 +1,7 @@
 use crate::consts::KEY_POOL;
 use crate::db::Error;
 use crate::record::RecordMeta;
-use crate::TreeBundle;
+use crate::TypedTree;
 use hills_base::{GenericKey, TreeKey, TreeRoot};
 use rkyv::ser::serializers::AllocSerializer;
 use rkyv::validation::validators::DefaultValidator;
@@ -27,9 +27,12 @@ pub trait OpaqueTree {
     fn to_ron_str_pretty(&self, key: &OpaqueKey) -> Result<String, Error>;
     fn insert_from_ron_str(&mut self, value: &str) -> Result<GenericKey, Error>;
     fn update_from_ron_str(&mut self, key: &OpaqueKey, value: &str) -> Result<(), Error>;
+    fn remove(&mut self, key: &OpaqueKey) -> Result<(), Error>;
+
+    fn versioning(&self) -> bool;
 }
 
-impl<K, V> OpaqueTree for TreeBundle<K, V>
+impl<K, V> OpaqueTree for TypedTree<K, V>
 where
     K: TreeKey + Debug,
     V: TreeRoot
@@ -120,5 +123,25 @@ where
         let key: K = K::from_generic(key);
         let value: V = ron::de::from_str(value).map_err(|e| Error::Internal(format!("{e:?}")))?;
         self.update(key, value)
+    }
+
+    fn remove(&mut self, key: &OpaqueKey) -> Result<(), Error> {
+        if key.tree_name.as_str() != self.tree_name.as_str() {
+            return Err(Error::Usage(format!(
+                "Tried to use {} key with {} tree",
+                key.tree_name, self.tree_name
+            )));
+        }
+        let key = GenericKey {
+            id: key.id,
+            revision: key.revision,
+        };
+        let key: K = K::from_generic(key);
+        <TypedTree<K, V>>::remove(self, key)?;
+        Ok(())
+    }
+
+    fn versioning(&self) -> bool {
+        V::versioning()
     }
 }
