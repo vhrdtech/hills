@@ -47,8 +47,6 @@ pub struct HillsClient {
 struct RawTreeBundle {
     /// Key -> Record tree
     data: Tree,
-    /// All latest revisions -> ()
-    latest_revision_index: Tree,
     versioning: bool,
     indexers: Vec<Box<dyn TreeIndex>>,
 }
@@ -57,8 +55,6 @@ struct RawTreeBundle {
 pub struct TypedTree<K, V> {
     /// Key -> Record tree
     pub(crate) data: Tree,
-    /// Monotonic index -> Key for all the latest revisions
-    pub(crate) latest_revision_index: Tree,
 
     pub(crate) tree_name: Arc<String>,
     uuid: Uuid,
@@ -226,13 +222,12 @@ impl HillsClient {
         match self.open_trees.get(tree_name) {
             Some(raw_tree) => Ok(TypedTree {
                 data: raw_tree.data.clone(),
-                latest_revision_index: raw_tree.latest_revision_index.clone(),
                 username: username.as_ref().to_string(),
                 versioning: raw_tree.versioning,
                 tree_name: Arc::new(tree_name.to_string()),
                 event_tx: self.event_tx.clone(),
                 uuid: self.self_uuid,
-                indexers: Vec::new(),
+                indexers: raw_tree.indexers.clone(),
 
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
@@ -244,13 +239,12 @@ impl HillsClient {
                 };
                 Ok(TypedTree {
                     data: bundle.data.clone(),
-                    latest_revision_index: bundle.latest_revision_index.clone(),
                     username: username.as_ref().to_string(),
                     versioning,
                     tree_name: Arc::new(tree_name.to_string()),
                     event_tx: self.event_tx.clone(),
                     uuid: self.self_uuid,
-                    indexers: Vec::new(),
+                    indexers: bundle.indexers.clone(),
 
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
@@ -259,7 +253,7 @@ impl HillsClient {
         }
     }
 
-    pub fn add_indexer<K, V>(&mut self, mut indexer: Box<dyn TreeIndex>) -> Result<(), Error>
+    pub fn add_indexer<K, V>(&mut self, mut indexer: Box<dyn TreeIndex + Send>) -> Result<(), Error>
     where
         K: TreeKey,
         V: TreeRoot + Reflect,
@@ -274,7 +268,14 @@ impl HillsClient {
             tree: &mut bundle.data,
             evolution,
         })?;
-        bundle.indexers.push(indexer);
+        bundle.indexers.push(indexer.clone());
+        let r = self.cmd_tx.blocking_send(SyncClientCommand::RegisterIndex {
+            tree_name: tree_name.to_string(),
+            indexer,
+        });
+        if r.is_err() {
+            warn!("db: add_indexer: send failed");
+        }
         Ok(())
     }
 
@@ -373,13 +374,9 @@ impl HillsClient {
             }
         }
         let data = self.db.open_tree(tree_name.as_bytes())?;
-        let latest_revision_index = self
-            .db
-            .open_tree(format!("{tree_name}_latest_revision_index").as_bytes())?;
 
         let bundle = RawTreeBundle {
             data,
-            latest_revision_index,
             versioning,
             indexers: Vec::new(),
         };
@@ -489,17 +486,16 @@ where
             created: Utc::now().into(),
             rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
-            evolution,
         };
         let record = Record {
             meta_iteration: 0,
             meta,
             data_iteration: 0,
             data,
+            data_evolution: evolution,
         };
         let record = to_bytes::<_, 128>(&record)?;
         self.data.insert(key_bytes, &*record)?;
-        self.latest_revision_index.insert(key_bytes, &[])?;
 
         let change = RecordHotChange {
             tree: String::from(self.tree_name.as_str()),
@@ -527,11 +523,11 @@ where
         }
         if let Some(previous) = generic_key.previous_revision() {
             let previous = previous.to_bytes();
-            if !self.latest_revision_index.contains_key(previous)? {
-                return Err(Error::VersioningMismatch(format!(
-                    "Cannot insert next revision without previous {key:?}"
-                )));
-            }
+            // if !self.latest_revision_index.contains_key(previous)? {
+            //     return Err(Error::VersioningMismatch(format!(
+            //         "Cannot insert next revision without previous {key:?}"
+            //     )));
+            // }
             let Some(previous_record) = self.data.get(previous)? else {
                 return Err(Error::Internal(format!(
                     "Previous version of {key:?} is not in the data tree"
@@ -541,7 +537,7 @@ where
             if matches!(previous_record.meta.version, ArchivedVersion::Draft) {
                 return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
             }
-            self.latest_revision_index.remove(previous)?;
+            // self.latest_revision_index.remove(previous)?;
         }
 
         if let Some(replacing) = self.data.get(key_bytes)? {
@@ -582,17 +578,17 @@ where
                     .expect(""),
                 rust_version: SimpleVersion::rust_version(),
                 rkyv_version: SimpleVersion::rkyv_version(),
-                evolution,
             };
             let record = Record {
                 meta_iteration: replacing.meta_iteration + 1,
                 meta,
                 data_iteration: replacing.data_iteration + 1,
                 data,
+                data_evolution: evolution,
             };
             let record_bytes = to_bytes::<_, 128>(&record)?;
             self.data.insert(key_bytes, &*record_bytes)?;
-            self.latest_revision_index.insert(key_bytes, &[])?;
+            // self.latest_revision_index.insert(key_bytes, &[])?;
 
             let change = RecordHotChange {
                 tree: String::from(self.tree_name.as_str()),
@@ -620,8 +616,7 @@ where
             Some(bytes) => {
                 let archived_record = check_archived_root::<Record>(&bytes)?;
                 let record_evolution: SimpleVersion = archived_record
-                    .meta
-                    .evolution
+                    .data_evolution
                     .deserialize(&mut rkyv::Infallible)
                     .expect("");
                 if record_evolution != V::evolution() {
@@ -651,8 +646,7 @@ where
                 let archived_record = check_archived_root::<Record>(&bytes)?;
 
                 let record_evolution: SimpleVersion = archived_record
-                    .meta
-                    .evolution
+                    .data_evolution
                     .deserialize(&mut rkyv::Infallible)
                     .expect("");
                 if record_evolution != V::evolution() {
@@ -702,45 +696,49 @@ where
                 }
                 self.data.remove(key_bytes)?;
 
+                let change = RecordHotChange {
+                    tree: String::from(self.tree_name.as_str()),
+                    key: generic_key,
+                    meta_iteration: archived_record.meta_iteration,
+                    data_iteration: archived_record.data_iteration,
+                    kind: ChangeKind::Remove,
+                };
+                self.event_tx
+                    .blocking_send(change)
+                    .map_err(|_| Error::Mpsc)?;
+
                 Ok(Some(()))
             }
             None => Ok(None),
         }
     }
 
-    pub fn meta(&self, key: K) -> Result<Option<(u32, RecordMeta, u32)>, Error> {
+    pub fn meta(&self, key: K) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error> {
         let key_bytes = key.to_generic().to_bytes();
         let value = self.data.get(key_bytes)?;
         match value {
             Some(bytes) => {
                 let archived_record = check_archived_root::<Record>(&bytes)?;
                 let meta: RecordMeta = archived_record.meta.deserialize(&mut rkyv::Infallible)?;
+                let evolution = archived_record
+                    .data_evolution
+                    .deserialize(&mut rkyv::Infallible)
+                    .expect("");
 
                 Ok(Some((
                     archived_record.meta_iteration,
                     meta,
                     archived_record.data_iteration,
+                    evolution,
                 )))
             }
             None => Ok(None),
         }
     }
 
-    pub fn latest_revisions(&self) -> impl Iterator<Item = K> {
-        self.latest_revision_index.iter().keys().filter_map(|key| {
-            if let Ok(key) = key {
-                if key == KEY_POOL {
-                    return None;
-                }
-                let key = GenericKey::from_bytes(&key)?;
-                let key = K::from_generic(key);
-                Some(key)
-            } else {
-                warn!("Err in latest_revisions");
-                None
-            }
-        })
-    }
+    // pub fn latest_revisions(&self) -> impl Iterator<Item = K> {
+    //     todo!()
+    // }
 
     pub fn all_revisions(&self) -> impl Iterator<Item = K> {
         self.data.iter().keys().filter_map(|key| {

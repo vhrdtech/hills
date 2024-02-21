@@ -322,7 +322,7 @@ async fn process_message(
                             return Ok(());
                         }
                     }
-                    sync_common::handle_incoming_record(db, hot_sync_event, &remote_name)?;
+                    sync_common::handle_incoming_record(db, hot_sync_event, &remote_name, None)?;
                     let mut hot_sync_event_owned: HotSyncEvent =
                         hot_sync_event.deserialize(&mut rkyv::Infallible).expect("");
                     hot_sync_event_owned.source_addr = Some(state.remote_addr);
@@ -351,6 +351,10 @@ async fn process_message(
                         let record = check_archived_root::<Record>(record)?;
                         let meta: RecordMeta =
                             record.meta.deserialize(&mut rkyv::Infallible).expect("");
+                        let evolution = record
+                            .data_evolution
+                            .deserialize(&mut rkyv::Infallible)
+                            .expect("");
                         let data = record.data.to_vec();
                         let hot_change_ev = HotSyncEvent {
                             tree_name: tree_name.to_string(),
@@ -361,6 +365,7 @@ async fn process_message(
                                 meta_iteration: record.meta_iteration,
                                 data,
                                 data_iteration: record.data_iteration,
+                                data_evolution: evolution,
                             },
                         };
                         broadcast_tx

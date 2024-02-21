@@ -22,6 +22,8 @@ pub struct Record {
 
     /// 0 when first created, must be incremented each time data is changed.
     pub data_iteration: u32,
+    /// Data type version used to serialize the data.
+    pub data_evolution: SimpleVersion,
     /// None when only id was created, but no data has been written yet.
     pub data: AlignedVec,
 }
@@ -50,8 +52,8 @@ pub struct RecordMeta {
     pub rust_version: SimpleVersion,
     /// rkyv version that was used to serialize the data.
     pub rkyv_version: SimpleVersion,
-    /// User program version used to serialize the data.
-    pub evolution: SimpleVersion,
+    // User program version used to serialize the data.
+    // pub evolution: SimpleVersion,
 }
 
 /// Record state

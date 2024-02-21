@@ -2,7 +2,7 @@ use crate::consts::KEY_POOL;
 use crate::db::Error;
 use crate::record::RecordMeta;
 use crate::TypedTree;
-use hills_base::{GenericKey, TreeKey, TreeRoot};
+use hills_base::{GenericKey, SimpleVersion, TreeKey, TreeRoot};
 use rkyv::ser::serializers::AllocSerializer;
 use rkyv::validation::validators::DefaultValidator;
 use rkyv::{Archive, CheckBytes, Deserialize, Serialize};
@@ -19,7 +19,7 @@ pub struct OpaqueKey {
 
 pub trait OpaqueTree {
     fn keys_in_pool(&self) -> Result<u32, Error>;
-    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32)>, Error>;
+    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error>;
 
     fn all_revisions(&self) -> Box<dyn Iterator<Item = OpaqueKey> + '_>;
     fn latest_revisions(&self) -> Box<dyn Iterator<Item = OpaqueKey>>;
@@ -47,7 +47,7 @@ where
         self.key_pool_stats()
     }
 
-    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32)>, Error> {
+    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error> {
         if key.tree_name.as_str() != self.tree_name.as_str() {
             return Err(Error::Usage(format!(
                 "Tried to use {} key with {} tree",

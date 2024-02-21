@@ -1,6 +1,8 @@
 use crate::common::{Error, ManagedTrees};
 use crate::handle_result;
+use crate::index::{Action, TreeIndex, TypeErasedTree};
 use crate::key_pool::KeyPool;
+use crate::record::Record;
 use crate::sync::{ArchivedEvent, Event, RecordHotChange};
 use crate::sync_common::{
     compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
@@ -11,11 +13,12 @@ use futures_util::{
     Sink, SinkExt, StreamExt, TryStreamExt,
 };
 use hills_base::GenericKey;
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::{check_archived_root, to_bytes};
+use rkyv::{check_archived_root, to_bytes, Deserialize};
 use sled::Db;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Runtime;
@@ -48,6 +51,10 @@ pub enum SyncClientCommand {
     Connect(IpAddr, u16),
     Disconnect,
     TreeCreated(String),
+    RegisterIndex {
+        tree_name: String,
+        indexer: Box<dyn TreeIndex + Send>,
+    },
     // FullReSync,
 }
 
@@ -74,6 +81,7 @@ async fn event_loop(
 ) {
     let mut ws_txrx: Option<(SplitSink<_, _>, SplitStream<_>)> = None;
     // let mut to_replay = Vec::new();
+    let mut indexers: HashMap<String, Vec<Box<dyn TreeIndex + Send>>> = HashMap::new();
 
     loop {
         let mut should_disconnect = false;
@@ -85,8 +93,105 @@ async fn event_loop(
                             if let Message::Close(_) = &message {
                                 should_disconnect = true;
                             }
-                            let r = process_message(message, &mut db, ws_tx).await;
-                            handle_result!(r);
+                            // let r = process_message(message, &mut db, ws_tx, &indexers).await;
+                            match message {
+                                Message::Binary(bytes) => {
+                                    let Ok(ev) = check_archived_root::<Event>(&bytes) else {
+                                        error!("message unarchive failed");
+                                        continue
+                                    };
+                                    match ev {
+                                        ArchivedEvent::PresentSelf { uuid } => {
+                                            trace!("Server uuid is: {uuid:x?}");
+                                        }
+                                        ArchivedEvent::Subscribe { .. } => {}
+                                        ArchivedEvent::GetTreeOverview { .. } => {}
+                                        ArchivedEvent::TreeOverview { tree, records } => {
+                                            trace!("Got {tree} overview {records:?}");
+                                            if let Err(e) = compare_and_request_missing_records(&db, tree, records, ws_tx).await {
+                                                error!("tree overview: {e:?}");
+                                            }
+                                        }
+                                        ArchivedEvent::KeySet { tree, keys } => {
+                                            trace!("Got more keys for {tree} {keys:?}");
+                                            let Ok(tree) = db.open_tree(tree.as_str()) else {
+                                                error!("key set open_tree failed");
+                                                continue
+                                            };
+                                            let keys = keys.start..keys.end;
+                                            if let Err(e) = KeyPool::feed_for(&tree, keys).map_err(Error::Internal) {
+                                                error!("key set: {e:?}");
+                                            }
+                                        }
+                                        ArchivedEvent::CheckedOut { .. } => {}
+                                        ArchivedEvent::AlreadyCheckedOut { .. } => {}
+                                        ArchivedEvent::HotSyncEvent(hot_sync_event) => {
+                                            if let Err(e) = handle_incoming_record(&mut db, hot_sync_event, "server", Some(&mut indexers)) {
+                                                error!("hot sync event, handle_incoming_record: {e:?}");
+                                            }
+                                        }
+                                        ArchivedEvent::CheckOut { .. }
+                                        | ArchivedEvent::Return { .. }
+                                        | ArchivedEvent::GetKeySet { .. } => {
+                                            warn!("Unsupported event from server");
+                                        }
+                                        ArchivedEvent::RequestRecords { tree, keys } => {
+                                            if let Err(e) = send_records(&db, tree.as_str(), keys, ws_tx).await {
+                                                error!("send_records: {e:?}");
+                                            }
+                                        }
+                                        ArchivedEvent::RecordAsRequested {
+                                            tree_name,
+                                            key,
+                                            record,
+                                        } => {
+                                            let Ok(tree) = db.open_tree(tree_name.as_str()) else {
+                                                error!("open tree {tree_name} failed");
+                                                continue
+                                            };
+                                            let key = GenericKey::from_archived(key);
+                                            let key_bytes = key.to_bytes();
+                                            let Ok(contains) = tree.contains_key(key_bytes) else {
+                                                error!("record as requested: contains_key failed");
+                                                continue
+                                            };
+                                            if contains {
+                                                warn!("record as requested: {tree_name}/{key} already exist");
+                                            } else {
+                                                let Ok(archived_record) = check_archived_root::<Record>(&record) else {
+                                                    error!("record as requested unarchive failed");
+                                                    continue;
+                                                };
+                                                let data_evolution = archived_record
+                                                    .data_evolution
+                                                    .deserialize(&mut rkyv::Infallible)
+                                                    .expect("");
+                                                if let Some(indexers) = indexers.get_mut(tree_name.as_str()) {
+                                                    for indexer in indexers {
+                                                        let r = indexer.update(
+                                                            TypeErasedTree {
+                                                                tree: &tree,
+                                                                evolution: data_evolution,
+                                                            },
+                                                            key,
+                                                            archived_record.data.as_slice(),
+                                                            Action::Insert,
+                                                        );
+                                                        if r.is_err() {
+                                                            error!("indexer failed on requested record creation, {tree_name}:{key}");
+                                                        }
+                                                    }
+                                                }
+                                                tree.insert(key_bytes, record.as_slice()).unwrap();
+                                                trace!("{tree_name}/{key} inserted");
+                                            }
+                                        }
+                                    }
+                                }
+                                u => {
+                                    warn!("Unsupported ws message: {u:?}");
+                                }
+                            }
                         }
                         Ok(None) => {
                             warn!("ws_tx: None");
@@ -111,6 +216,9 @@ async fn event_loop(
                         SyncClientCommand::TreeCreated(_tree_name) => {
                             let r = request_keys(&db, ws_tx).await;
                             handle_result!(r);
+                        }
+                        SyncClientCommand::RegisterIndex { tree_name, indexer } => {
+                            indexers.entry(tree_name).or_default().push(indexer);
                         }
                     }
                 }
@@ -162,6 +270,9 @@ async fn event_loop(
                         SyncClientCommand::Disconnect => {}
                         SyncClientCommand::TreeCreated(_tree_name) => {
                         }
+                        SyncClientCommand::RegisterIndex { tree_name, indexer } => {
+                            indexers.entry(tree_name).or_default().push(indexer);
+                        }
                     }
                 }
                 event = event_rx.recv() => {
@@ -190,67 +301,68 @@ async fn event_loop(
     }
 }
 
-async fn process_message(
-    ws_message: Message,
-    db: &mut Db,
-    mut ws_tx: impl Sink<Message> + Unpin,
-) -> Result<(), Error> {
-    match ws_message {
-        Message::Binary(bytes) => {
-            let ev = check_archived_root::<Event>(&bytes)?;
-            match ev {
-                ArchivedEvent::PresentSelf { uuid } => {
-                    trace!("Server uuid is: {uuid:x?}");
-                }
-                ArchivedEvent::Subscribe { .. } => {}
-                ArchivedEvent::GetTreeOverview { .. } => {}
-                ArchivedEvent::TreeOverview { tree, records } => {
-                    trace!("Got {tree} overview {records:?}");
-                    compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
-                }
-                ArchivedEvent::KeySet { tree, keys } => {
-                    trace!("Got more keys for {tree} {keys:?}");
-                    let tree = db.open_tree(tree.as_str())?;
-                    let keys = keys.start..keys.end;
-                    KeyPool::feed_for(&tree, keys).map_err(Error::Internal)?;
-                }
-                ArchivedEvent::CheckedOut { .. } => {}
-                ArchivedEvent::AlreadyCheckedOut { .. } => {}
-                ArchivedEvent::HotSyncEvent(hot_sync_event) => {
-                    handle_incoming_record(db, hot_sync_event, "server")?;
-                }
-                ArchivedEvent::CheckOut { .. }
-                | ArchivedEvent::Return { .. }
-                | ArchivedEvent::GetKeySet { .. } => {
-                    warn!("Unsupported event from server");
-                }
-                ArchivedEvent::RequestRecords { tree, keys } => {
-                    send_records(db, tree.as_str(), keys, &mut ws_tx).await?;
-                }
-                ArchivedEvent::RecordAsRequested {
-                    tree_name,
-                    key,
-                    record,
-                } => {
-                    let tree = db.open_tree(tree_name.as_str())?;
-                    let key = GenericKey::from_archived(key);
-                    let key_bytes = key.to_bytes();
-                    if tree.contains_key(key_bytes)? {
-                        warn!("{tree_name}/{key} already exist");
-                    } else {
-                        tree.insert(key_bytes, record.as_slice())?;
-                        trace!("{tree_name}/{key} inserted");
-                    }
-                }
-            }
-        }
-        u => {
-            warn!("Unsupported ws message: {u:?}");
-        }
-    }
+// async fn process_message(
+//     ws_message: Message,
+//     db: &mut Db,
+//     mut ws_tx: impl Sink<Message> + Unpin,
+//     indexers: &HashMap<String, Vec<Box<dyn TreeIndex + Send>>>,
+// ) -> Result<(), Error> {
+//     match ws_message {
+//         Message::Binary(bytes) => {
+//             let ev = check_archived_root::<Event>(&bytes)?;
+//             match ev {
+//                 ArchivedEvent::PresentSelf { uuid } => {
+//                     trace!("Server uuid is: {uuid:x?}");
+//                 }
+//                 ArchivedEvent::Subscribe { .. } => {}
+//                 ArchivedEvent::GetTreeOverview { .. } => {}
+//                 ArchivedEvent::TreeOverview { tree, records } => {
+//                     trace!("Got {tree} overview {records:?}");
+//                     compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
+//                 }
+//                 ArchivedEvent::KeySet { tree, keys } => {
+//                     trace!("Got more keys for {tree} {keys:?}");
+//                     let tree = db.open_tree(tree.as_str())?;
+//                     let keys = keys.start..keys.end;
+//                     KeyPool::feed_for(&tree, keys).map_err(Error::Internal)?;
+//                 }
+//                 ArchivedEvent::CheckedOut { .. } => {}
+//                 ArchivedEvent::AlreadyCheckedOut { .. } => {}
+//                 ArchivedEvent::HotSyncEvent(hot_sync_event) => {
+//                     handle_incoming_record(db, hot_sync_event, "server")?;
+//                 }
+//                 ArchivedEvent::CheckOut { .. }
+//                 | ArchivedEvent::Return { .. }
+//                 | ArchivedEvent::GetKeySet { .. } => {
+//                     warn!("Unsupported event from server");
+//                 }
+//                 ArchivedEvent::RequestRecords { tree, keys } => {
+//                     send_records(db, tree.as_str(), keys, &mut ws_tx).await?;
+//                 }
+//                 ArchivedEvent::RecordAsRequested {
+//                     tree_name,
+//                     key,
+//                     record,
+//                 } => {
+//                     let tree = db.open_tree(tree_name.as_str())?;
+//                     let key = GenericKey::from_archived(key);
+//                     let key_bytes = key.to_bytes();
+//                     if tree.contains_key(key_bytes)? {
+//                         warn!("{tree_name}/{key} already exist");
+//                     } else {
+//                         tree.insert(key_bytes, record.as_slice())?;
+//                         trace!("{tree_name}/{key} inserted");
+//                     }
+//                 }
+//             }
+//         }
+//         u => {
+//             warn!("Unsupported ws message: {u:?}");
+//         }
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 pub async fn request_keys(db: &Db, ws_tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
     let trees = ManagedTrees::managed(db)?;

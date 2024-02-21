@@ -5,6 +5,7 @@ use sled::Tree;
 
 use crate::{consts::KEY_POOL, db::Error, record::Record};
 
+mod latest_revisions;
 pub mod named;
 
 pub enum Action {
@@ -14,7 +15,7 @@ pub enum Action {
 }
 
 pub struct TypeErasedTree<'a> {
-    pub(crate) tree: &'a mut Tree,
+    pub(crate) tree: &'a Tree,
     pub(crate) evolution: SimpleVersion,
 }
 
@@ -57,8 +58,7 @@ impl<'a> TypeErasedTree<'a> {
             Some(bytes) => {
                 let archived_record = check_archived_root::<Record>(&bytes)?;
                 let record_evolution: SimpleVersion = archived_record
-                    .meta
-                    .evolution
+                    .data_evolution
                     .deserialize(&mut rkyv::Infallible)
                     .expect("");
                 if record_evolution != self.evolution {

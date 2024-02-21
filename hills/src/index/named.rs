@@ -39,6 +39,9 @@ impl TreeIndex for NamedIndexer {
                 let s = (self.extractor)(data);
                 s
             })?;
+            if s.is_empty() {
+                return Err(Error::IndexReject("Empty name".to_string()));
+            }
             if wr.index.contains_key(&s) {
                 return Err(Error::IndexReject(format!("Duplicate {s}")));
             }
@@ -61,6 +64,9 @@ impl TreeIndex for NamedIndexer {
         match action {
             Action::Insert => {
                 let s = (self.extractor)(data);
+                if s.is_empty() {
+                    return Err(Error::IndexReject("Empty name".to_string()));
+                }
                 if wr.index.contains_key(&s) {
                     return Err(Error::IndexReject(format!("Duplicate {s}")));
                 }
@@ -73,9 +79,12 @@ impl TreeIndex for NamedIndexer {
                     .find(|(_, v)| **v == key)
                     .map(|(k, _)| k.to_string())
                 else {
-                    return Err(Error::IndexReject("{old_name} not found".to_string()));
+                    return Err(Error::IndexReject("old name not found".to_string()));
                 };
                 let new_name = (self.extractor)(data);
+                if new_name.is_empty() {
+                    return Err(Error::IndexReject("Empty name".to_string()));
+                }
                 if old_name != new_name {
                     if wr.index.contains_key(&new_name) {
                         return Err(Error::IndexReject(format!("Duplicate {new_name}")));
@@ -89,6 +98,7 @@ impl TreeIndex for NamedIndexer {
                 wr.index.remove(&s);
             }
         }
+        log::debug!("{:?}", wr.index);
         Ok(())
     }
 }
@@ -101,7 +111,7 @@ impl NamedIndex {
         }
     }
 
-    pub fn indexer(&self) -> Box<dyn TreeIndex> {
+    pub fn indexer(&self) -> Box<dyn TreeIndex + Send> {
         Box::new(NamedIndexer {
             storage: self.storage.clone(),
             extractor: self.exctractor.clone(),

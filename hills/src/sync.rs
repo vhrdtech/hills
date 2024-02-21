@@ -1,5 +1,5 @@
 use crate::record::RecordMeta;
-use hills_base::GenericKey;
+use hills_base::{GenericKey, SimpleVersion};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -113,6 +113,7 @@ pub enum HotSyncEventKind {
         // Might be non zero when relayed from server after doing cold sync
         meta_iteration: u32,
         data: Vec<u8>,
+        data_evolution: SimpleVersion,
         data_iteration: u32,
     },
     MetaChanged {
@@ -123,6 +124,7 @@ pub enum HotSyncEventKind {
         meta: RecordMeta,
         meta_iteration: u32,
         data: Vec<u8>,
+        data_evolution: SimpleVersion,
         data_iteration: u32,
     },
     Removed,

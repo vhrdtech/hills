@@ -67,7 +67,6 @@ impl ManagedTrees {
         let tree_name = tree_name.as_ref();
         match db.get(MANAGED_TREES)? {
             Some(trees) => {
-                trace!("Have managed trees");
                 let trees = check_archived_root::<ManagedTrees>(&trees)?;
                 if !trees.trees.contains(tree_name) {
                     let mut trees: ManagedTrees = trees.deserialize(&mut rkyv::Infallible)?;
@@ -84,7 +83,6 @@ impl ManagedTrees {
                 };
                 let trees_bytes = to_bytes::<_, 128>(&trees)?;
                 db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
-                trace!("Creating new managed trees");
             }
         }
         Ok(())
