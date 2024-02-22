@@ -170,11 +170,18 @@ pub async fn compare_and_request_missing_records(
     tree_name: impl AsRef<str>,
     records: &ArchivedHashMap<ArchivedGenericKey, ArchivedRecordIteration>,
     ws_tx: &mut (impl Sink<Message> + Unpin),
-) -> Result<(), Error> {
+    removed: &[GenericKey],
+) -> Result<Vec<GenericKey>, Error> {
     let tree = db.open_tree(tree_name.as_ref())?;
     let mut missing_or_outdated = Vec::new();
+    let mut found_in_removed = Vec::new();
     for (key, remote_record) in records.iter() {
         let key = GenericKey::from_archived(key);
+        if removed.contains(&key) {
+            found_in_removed.push(key);
+            continue;
+        }
+
         let key_bytes = key.to_bytes();
         match tree.get(key_bytes)? {
             Some(record) => {
@@ -203,7 +210,7 @@ pub async fn compare_and_request_missing_records(
         .send(Message::Binary(ev_bytes.to_vec()))
         .await
         .map_err(|_| Error::Ws)?;
-    Ok(())
+    Ok(found_in_removed)
 }
 
 #[macro_export]

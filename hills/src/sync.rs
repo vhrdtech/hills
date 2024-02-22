@@ -165,3 +165,24 @@ impl Debug for ArchivedRecordIteration {
         )
     }
 }
+
+impl Display for ArchivedHotSyncEventKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArchivedHotSyncEventKind::Created {
+                meta_iteration,
+                data_iteration,
+                ..
+            } => write!(f, "Created m{meta_iteration} d{data_iteration}"),
+            ArchivedHotSyncEventKind::MetaChanged { meta_iteration, .. } => {
+                write!(f, "Meta changed m{meta_iteration}")
+            }
+            ArchivedHotSyncEventKind::Changed {
+                meta_iteration,
+                data_iteration,
+                ..
+            } => write!(f, "Changed m{meta_iteration} d{data_iteration}"),
+            ArchivedHotSyncEventKind::Removed => write!(f, "Removed"),
+        }
+    }
+}

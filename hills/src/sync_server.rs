@@ -17,8 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -98,6 +100,7 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
     info!("Server event loop started");
     let (broadcast_tx, broadcast_rx) = postage::broadcast::channel(256);
     drop(broadcast_rx);
+    let removed = Arc::new(RwLock::new(HashMap::new()));
     loop {
         match listener.accept().await {
             Ok((tcp_stream, remote_addr)) => {
@@ -119,8 +122,9 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
                 };
                 let rx = broadcast_tx.subscribe();
                 let tx = broadcast_tx.clone();
+                let removed = removed.clone();
                 tokio::spawn(async move {
-                    ws_event_loop(ws_sink, ws_source, db_clone, state, rx, tx).await
+                    ws_event_loop(ws_sink, ws_source, db_clone, state, rx, tx, removed).await
                 });
             }
             Err(e) => {
@@ -137,8 +141,9 @@ async fn ws_event_loop(
     mut state: State,
     mut broadcast_rx: postage::broadcast::Receiver<HotSyncEvent>,
     mut broadcast_tx: postage::broadcast::Sender<HotSyncEvent>,
+    removed: Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
 ) {
-    info!("Event loop started");
+    info!("Event loop for {}: started", state.remote_addr);
     let r = present_self(&db, &mut ws_tx).await;
     handle_result!(r);
     let r = send_tree_overviews(&db, &mut ws_tx).await;
@@ -154,7 +159,7 @@ async fn ws_event_loop(
                         if let Message::Close(_) = &message {
                             break;
                         }
-                        let r = process_message(message, &mut ws_tx, &mut db, &mut state, &mut broadcast_tx).await;
+                        let r = process_message(message, &mut ws_tx, &mut db, &mut state, &mut broadcast_tx, &removed).await;
                         handle_result!(r);
                     }
                     Ok(None) => {
@@ -168,7 +173,7 @@ async fn ws_event_loop(
             }
             event = broadcast_rx.recv() => {
                 let Some(event) = event else {
-                    warn!("broadcast_rx returned None");
+                    warn!("broadcast_rx returned None {}", state.remote_addr);
                     continue
                 };
                 // trace!("hot change from {:?} in {} event loop", event.source_addr, state.remote_addr);
@@ -184,7 +189,7 @@ async fn ws_event_loop(
         }
     }
 
-    info!("Event loop: exiting");
+    info!("Event loop {}: exiting", state.remote_addr);
 }
 
 async fn process_message(
@@ -193,6 +198,7 @@ async fn process_message(
     db: &mut Db,
     state: &mut State,
     broadcast_tx: &mut postage::broadcast::Sender<HotSyncEvent>,
+    removed: &Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
 ) -> Result<(), Error> {
     use postage::prelude::Sink;
     match ws_message {
@@ -232,7 +238,32 @@ async fn process_message(
                 ArchivedEvent::GetTreeOverview { .. } => {}
                 ArchivedEvent::TreeOverview { tree, records } => {
                     trace!("Got {}/{tree} overview {records:?}", state.remote_addr);
-                    compare_and_request_missing_records(db, tree, records, &mut ws_tx).await?;
+                    let removed = removed
+                        .read()
+                        .await
+                        .get(tree.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    let found_in_removed = compare_and_request_missing_records(
+                        db, tree, records, &mut ws_tx, &removed,
+                    )
+                    .await?;
+                    if !found_in_removed.is_empty() {
+                        trace!("To be removed on client: {found_in_removed:?}");
+                    }
+                    for key in found_in_removed {
+                        let ev = Event::HotSyncEvent(HotSyncEvent {
+                            tree_name: tree.to_string(),
+                            key,
+                            source_addr: None,
+                            kind: HotSyncEventKind::Removed,
+                        });
+                        let ev_bytes = to_bytes::<_, 128>(&ev)?;
+                        ws_tx
+                            .send(Message::Binary(ev_bytes.to_vec()))
+                            .await
+                            .map_err(|_| Error::Ws)?;
+                    }
                 }
                 ArchivedEvent::GetKeySet { tree } => {
                     let key_count = 1000;
@@ -312,15 +343,29 @@ async fn process_message(
                     let tree_name = hot_sync_event.tree_name.as_str();
                     let key = GenericKey::from_archived(&hot_sync_event.key);
                     let remote_name = format!("{}", state.remote_addr);
-                    trace!("Got hot sync from {remote_name}/{tree_name}/{key}");
-                    if let ArchivedHotSyncEventKind::Created { .. } = hot_sync_event.kind {
-                        if !client_info.owns_key(tree_name, key) {
-                            warn!(
-                                "{} tried to create a record with id {} it doesn't own",
-                                remote_name, key
-                            );
-                            return Ok(());
+                    trace!(
+                        "Got hot sync from {remote_name}/{tree_name}/{key}: {}",
+                        hot_sync_event.kind
+                    );
+                    match hot_sync_event.kind {
+                        ArchivedHotSyncEventKind::Created { .. } => {
+                            if !client_info.owns_key(tree_name, key) {
+                                warn!(
+                                    "{} tried to create a record with id {} it doesn't own",
+                                    remote_name, key
+                                );
+                                return Ok(());
+                            }
                         }
+                        ArchivedHotSyncEventKind::Removed => {
+                            removed
+                                .write()
+                                .await
+                                .entry(tree_name.to_string())
+                                .or_default()
+                                .push(key);
+                        }
+                        _ => {}
                     }
                     sync_common::handle_incoming_record(db, hot_sync_event, &remote_name, None)?;
                     let mut hot_sync_event_owned: HotSyncEvent =

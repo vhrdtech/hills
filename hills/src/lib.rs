@@ -13,7 +13,7 @@ pub mod sync_server;
 pub mod tree;
 
 pub use db::{HillsClient, TypedTree};
-pub use sync_client::{VhrdDbCmdTx, VhrdDbTelem};
+pub use sync_client::VhrdDbTelem;
 
 pub use hills_base::{GenericKey, TreeKey, UtcDateTime};
 

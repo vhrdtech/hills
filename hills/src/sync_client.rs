@@ -31,11 +31,14 @@ pub struct VhrdDbSyncHandle {
 }
 
 impl VhrdDbSyncHandle {
-    pub fn new(db: Db, rx: Receiver<RecordHotChange>) -> Self {
+    pub(crate) fn new(db: Db, rx: Receiver<RecordHotChange>) -> Self {
         Self { db, event_rx: rx }
     }
 
-    pub fn start(self, rt: &Runtime) -> (Sender<SyncClientCommand>, VhrdDbTelem, JoinHandle<()>) {
+    pub(crate) fn start(
+        self,
+        rt: &Runtime,
+    ) -> (Sender<SyncClientCommand>, VhrdDbTelem, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = channel(64);
         let telem = SyncClientTelemetry::default();
         let telem = Arc::new(RwLock::new(telem));
@@ -47,7 +50,7 @@ impl VhrdDbSyncHandle {
     }
 }
 
-pub enum SyncClientCommand {
+pub(crate) enum SyncClientCommand {
     Connect(IpAddr, u16),
     Disconnect,
     TreeCreated(String),
@@ -58,7 +61,7 @@ pub enum SyncClientCommand {
     // FullReSync,
 }
 
-pub type VhrdDbCmdTx = Sender<SyncClientCommand>;
+pub(crate) type VhrdDbCmdTx = Sender<SyncClientCommand>;
 
 #[derive(Default)]
 pub struct SyncClientTelemetry {
@@ -108,7 +111,7 @@ async fn event_loop(
                                         ArchivedEvent::GetTreeOverview { .. } => {}
                                         ArchivedEvent::TreeOverview { tree, records } => {
                                             trace!("Got {tree} overview {records:?}");
-                                            if let Err(e) = compare_and_request_missing_records(&db, tree, records, ws_tx).await {
+                                            if let Err(e) = compare_and_request_missing_records(&db, tree, records, ws_tx, &[]).await {
                                                 error!("tree overview: {e:?}");
                                             }
                                         }
@@ -126,6 +129,12 @@ async fn event_loop(
                                         ArchivedEvent::CheckedOut { .. } => {}
                                         ArchivedEvent::AlreadyCheckedOut { .. } => {}
                                         ArchivedEvent::HotSyncEvent(hot_sync_event) => {
+                                            let tree_name = hot_sync_event.tree_name.as_str();
+                                            let key = GenericKey::from_archived(&hot_sync_event.key);
+                                            trace!(
+                                                "Got hot sync {tree_name}/{key}: {}",
+                                                hot_sync_event.kind
+                                            );
                                             if let Err(e) = handle_incoming_record(&mut db, hot_sync_event, "server", Some(&mut indexers)) {
                                                 error!("hot sync event, handle_incoming_record: {e:?}");
                                             }
@@ -223,8 +232,8 @@ async fn event_loop(
                     }
                 }
                 event = event_rx.recv() => {
-                    trace!("ev: {event:?}");
                     if let Some(event) = event {
+                        trace!("{event:?}");
                         let r = send_hot_change(&db, event, ws_tx, None).await;
                         handle_result!(r);
                     }
