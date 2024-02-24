@@ -38,6 +38,17 @@ pub enum ChangeKind {
     Remove,
 }
 
+impl From<&ArchivedHotSyncEventKind> for ChangeKind {
+    fn from(value: &ArchivedHotSyncEventKind) -> Self {
+        match value {
+            ArchivedHotSyncEventKind::Created { .. } => ChangeKind::Create,
+            ArchivedHotSyncEventKind::MetaChanged { .. } => ChangeKind::ModifyMeta,
+            ArchivedHotSyncEventKind::Changed { .. } => ChangeKind::ModifyBoth,
+            ArchivedHotSyncEventKind::Removed => ChangeKind::Remove,
+        }
+    }
+}
+
 // TODO: Switch to serde with &[u8] support to avoid copying data buffer many times?
 #[derive(Archive, Clone, Serialize, Deserialize)]
 #[archive(check_bytes)]

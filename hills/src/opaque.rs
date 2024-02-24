@@ -10,16 +10,29 @@ use ron::ser::PrettyConfig;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OpaqueKey {
     pub tree_name: Arc<String>,
     pub id: u32,
     pub revision: u32,
 }
 
+impl OpaqueKey {
+    pub fn new(tree_name: Arc<String>, key: GenericKey) -> Self {
+        OpaqueKey {
+            tree_name,
+            id: key.id,
+            revision: key.revision,
+        }
+    }
+}
+
 pub trait OpaqueTree {
     fn keys_in_pool(&self) -> Result<u32, Error>;
-    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error>;
+    fn record_meta(
+        &self,
+        key: &OpaqueKey,
+    ) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error>;
 
     fn all_revisions(&self) -> Box<dyn Iterator<Item = OpaqueKey> + '_>;
     fn latest_revisions(&self) -> Box<dyn Iterator<Item = OpaqueKey>>;
@@ -47,7 +60,10 @@ where
         self.key_pool_stats()
     }
 
-    fn record_meta(&self, key: &OpaqueKey) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error> {
+    fn record_meta(
+        &self,
+        key: &OpaqueKey,
+    ) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error> {
         if key.tree_name.as_str() != self.tree_name.as_str() {
             return Err(Error::Usage(format!(
                 "Tried to use {} key with {} tree",

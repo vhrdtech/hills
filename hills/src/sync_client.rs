@@ -2,15 +2,16 @@ use crate::common::{Error, ManagedTrees};
 use crate::handle_result;
 use crate::index::{Action, TreeIndex, TypeErasedTree};
 use crate::key_pool::KeyPool;
+use crate::opaque::OpaqueKey;
 use crate::record::Record;
-use crate::sync::{ArchivedEvent, Event, RecordHotChange};
+use crate::sync::{ArchivedEvent, ChangeKind, Event, RecordHotChange};
 use crate::sync_common::{
     compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
     send_records, send_tree_overviews,
 };
 use futures_util::{
     stream::{SplitSink, SplitStream},
-    Sink, SinkExt, StreamExt, TryStreamExt,
+    SinkExt, StreamExt, TryStreamExt,
 };
 use hills_base::GenericKey;
 use log::{error, info, trace, warn};
@@ -30,6 +31,12 @@ pub struct VhrdDbSyncHandle {
     event_rx: Receiver<RecordHotChange>,
 }
 
+#[derive(Debug)]
+pub enum ChangeNotification {
+    Tree { key: OpaqueKey, kind: ChangeKind },
+    Borrowed,
+}
+
 impl VhrdDbSyncHandle {
     pub(crate) fn new(db: Db, rx: Receiver<RecordHotChange>) -> Self {
         Self { db, event_rx: rx }
@@ -38,13 +45,15 @@ impl VhrdDbSyncHandle {
     pub(crate) fn start(
         self,
         rt: &Runtime,
+        updates_tx: Sender<ChangeNotification>,
     ) -> (Sender<SyncClientCommand>, VhrdDbTelem, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = channel(64);
         let telem = SyncClientTelemetry::default();
         let telem = Arc::new(RwLock::new(telem));
         let telem_2 = telem.clone();
-        let join_handle =
-            rt.spawn(async move { event_loop(self.db, self.event_rx, cmd_rx, telem_2).await });
+        let join_handle = rt.spawn(async move {
+            event_loop(self.db, self.event_rx, cmd_rx, updates_tx, telem_2).await
+        });
 
         (cmd_tx, telem, join_handle)
     }
@@ -80,6 +89,7 @@ async fn event_loop(
     mut db: Db,
     mut event_rx: Receiver<RecordHotChange>,
     mut cmd_rx: Receiver<SyncClientCommand>,
+    mut updates_tx: Sender<ChangeNotification>,
     telem: VhrdDbTelem,
 ) {
     let mut ws_txrx: Option<(SplitSink<_, _>, SplitStream<_>)> = None;
@@ -138,6 +148,13 @@ async fn event_loop(
                                             if let Err(e) = handle_incoming_record(&mut db, hot_sync_event, "server", Some(&mut indexers)) {
                                                 error!("hot sync event, handle_incoming_record: {e:?}");
                                             }
+                                            let notification = ChangeNotification::Tree {
+                                                key: OpaqueKey::new(Arc::new(tree_name.to_string()), key),
+                                                kind: (&hot_sync_event.kind).into(),
+                                            };
+                                            if let Err(_) = postage::sink::Sink::send(&mut updates_tx, notification).await {
+                                                warn!("Notification send: mpsc fail");
+                                            }
                                         }
                                         ArchivedEvent::CheckOut { .. }
                                         | ArchivedEvent::Return { .. }
@@ -193,6 +210,13 @@ async fn event_loop(
                                                 }
                                                 tree.insert(key_bytes, record.as_slice()).unwrap();
                                                 trace!("{tree_name}/{key} inserted");
+                                                let notification = ChangeNotification::Tree {
+                                                    key: OpaqueKey::new(Arc::new(tree_name.to_string()), key),
+                                                    kind: ChangeKind::Create,
+                                                };
+                                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, notification).await {
+                                                    warn!("Notification send: mpsc fail");
+                                                }
                                             }
                                         }
                                     }
@@ -373,7 +397,10 @@ async fn event_loop(
 //     Ok(())
 // }
 
-pub async fn request_keys(db: &Db, ws_tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
+pub async fn request_keys(
+    db: &Db,
+    ws_tx: &mut (impl futures_util::Sink<Message> + Unpin),
+) -> Result<(), Error> {
     let trees = ManagedTrees::managed(db)?;
     for tree_name in &trees {
         let tree = db.open_tree(tree_name.as_str())?;

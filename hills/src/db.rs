@@ -2,10 +2,13 @@ use crate::common::ManagedTrees;
 use crate::consts::{KEY_POOL, SELF_UUID};
 use crate::index::{TreeIndex, TypeErasedTree};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
+use crate::opaque::OpaqueKey;
 use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::{ChangeKind, RecordHotChange};
-use crate::sync_client::{SyncClientCommand, SyncClientTelemetry, VhrdDbCmdTx, VhrdDbSyncHandle};
+use crate::sync_client::{
+    ChangeNotification, SyncClientCommand, SyncClientTelemetry, VhrdDbCmdTx, VhrdDbSyncHandle,
+};
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::VhrdDbTelem;
 use chrono::Utc;
@@ -38,8 +41,9 @@ pub struct HillsClient {
     self_uuid: Uuid,
     descriptors: Tree,
     open_trees: HashMap<String, RawTreeBundle>,
-    event_tx: postage::mpsc::Sender<RecordHotChange>,
     cmd_tx: VhrdDbCmdTx,
+    event_tx: postage::mpsc::Sender<RecordHotChange>,
+    updates_tx: postage::mpsc::Sender<ChangeNotification>,
     pub telem: VhrdDbTelem,
 }
 
@@ -61,7 +65,10 @@ pub struct TypedTree<K, V> {
     username: String,
     versioning: bool,
 
+    /// Notifications to server
     event_tx: postage::mpsc::Sender<RecordHotChange>,
+    /// Notifications to user
+    updates_tx: postage::mpsc::Sender<ChangeNotification>,
 
     indexers: Vec<Box<dyn TreeIndex>>,
 
@@ -167,7 +174,14 @@ impl HillsClient {
     pub fn open<P: AsRef<Path>>(
         path: P,
         rt: &Runtime,
-    ) -> Result<(HillsClient, JoinHandle<()>), Error> {
+    ) -> Result<
+        (
+            HillsClient,
+            postage::mpsc::Receiver<ChangeNotification>,
+            JoinHandle<()>,
+        ),
+        Error,
+    > {
         #[cfg(not(test))]
         let db = sled::open(path)?;
         #[cfg(test)]
@@ -194,7 +208,8 @@ impl HillsClient {
 
         let (tx, rx) = postage::mpsc::channel(64);
         let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
-        let (cmd_tx, telem, syncer_join) = sync_handle.start(rt);
+        let (updates_tx, updates_rx) = postage::mpsc::channel(64);
+        let (cmd_tx, telem, syncer_join) = sync_handle.start(rt, updates_tx.clone());
         Ok((
             HillsClient {
                 db,
@@ -203,8 +218,10 @@ impl HillsClient {
                 open_trees: HashMap::default(),
                 event_tx: tx,
                 cmd_tx,
+                updates_tx,
                 telem,
             },
+            updates_rx,
             syncer_join,
         ))
     }
@@ -226,6 +243,7 @@ impl HillsClient {
                 versioning: raw_tree.versioning,
                 tree_name: Arc::new(tree_name.to_string()),
                 event_tx: self.event_tx.clone(),
+                updates_tx: self.updates_tx.clone(),
                 uuid: self.self_uuid,
                 indexers: raw_tree.indexers.clone(),
 
@@ -243,6 +261,7 @@ impl HillsClient {
                     versioning,
                     tree_name: Arc::new(tree_name.to_string()),
                     event_tx: self.event_tx.clone(),
+                    updates_tx: self.updates_tx.clone(),
                     uuid: self.self_uuid,
                     indexers: bundle.indexers.clone(),
 
@@ -508,6 +527,14 @@ where
             .blocking_send(change)
             .map_err(|_| Error::Mpsc)?;
 
+        let notification = ChangeNotification::Tree {
+            key: OpaqueKey::new(self.tree_name.clone(), generic_key),
+            kind: ChangeKind::Create,
+        };
+        if let Err(_) = self.updates_tx.try_send(notification) {
+            warn!("Notification send: mpsc fail");
+        }
+
         Ok(K::from_generic(generic_key))
     }
 
@@ -600,6 +627,14 @@ where
             self.event_tx
                 .blocking_send(change)
                 .map_err(|_| Error::Mpsc)?;
+
+            let notification = ChangeNotification::Tree {
+                key: OpaqueKey::new(self.tree_name.clone(), generic_key),
+                kind: ChangeKind::ModifyBoth,
+            };
+            if let Err(_) = self.updates_tx.try_send(notification) {
+                warn!("Notification send: mpsc fail");
+            }
 
             Ok(())
         } else {
@@ -706,6 +741,14 @@ where
                 self.event_tx
                     .blocking_send(change)
                     .map_err(|_| Error::Mpsc)?;
+
+                let notification = ChangeNotification::Tree {
+                    key: OpaqueKey::new(self.tree_name.clone(), generic_key),
+                    kind: ChangeKind::Remove,
+                };
+                if let Err(_) = self.updates_tx.try_send(notification) {
+                    warn!("Notification send: mpsc fail");
+                }
 
                 Ok(Some(()))
             }
