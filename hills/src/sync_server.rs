@@ -1,9 +1,6 @@
 use crate::common::{Error, ManagedTrees};
-use crate::consts::SELF_UUID;
-use crate::record::{Record, RecordMeta};
-use crate::sync::{
-    ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind, RecordHotChange,
-};
+use crate::consts::{KEYS_PER_REQUEST, SELF_UUID};
+use crate::sync::{ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind};
 use crate::sync_common::{
     compare_and_request_missing_records, present_self, send_records, send_tree_overviews,
 };
@@ -39,7 +36,7 @@ struct ClientInfo {
     /// Which trees a client is subscribed to
     subscribed_to: HashSet<String>,
     readable_name: String,
-    to_replay: Vec<RecordHotChange>,
+    // to_replay: Vec<RecordHotChange>,
 }
 
 impl ClientInfo {
@@ -68,6 +65,20 @@ struct State {
     remote_addr: SocketAddr,
     info: Option<ClientInfo>,
 }
+
+impl State {
+    fn client_name(&self) -> String {
+        match &self.info {
+            Some(info) => format!("{}", info.readable_name),
+            None => format!("{}", self.remote_addr),
+        }
+    }
+}
+
+// struct RecordBorrows {
+//     /// tree name -> key -> queue of clients
+//     borrows: HashMap<String, HashMap<GenericKey, Vec<Uuid>>>,
+// }
 
 impl HillsServer {
     pub fn start<P: AsRef<Path>, A: ToSocketAddrs + Send + 'static>(
@@ -173,12 +184,12 @@ async fn ws_event_loop(
             }
             event = broadcast_rx.recv() => {
                 let Some(event) = event else {
-                    warn!("broadcast_rx returned None {}", state.remote_addr);
+                    warn!("broadcast_rx returned None {}", state.client_name());
                     continue
                 };
                 // trace!("hot change from {:?} in {} event loop", event.source_addr, state.remote_addr);
                 if event.source_addr != Some(state.remote_addr) {
-                    trace!("relaying event to {}", state.remote_addr);
+                    trace!("relaying event to {}", state.client_name());
                     let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(event)).unwrap();
                     let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
                     if r.is_err() {
@@ -189,7 +200,7 @@ async fn ws_event_loop(
         }
     }
 
-    info!("Event loop {}: exiting", state.remote_addr);
+    info!("Event loop {}: exiting", state.client_name());
 }
 
 async fn process_message(
@@ -205,7 +216,10 @@ async fn process_message(
         Message::Binary(bytes) => {
             let client_event = check_archived_root::<Event>(&bytes)?;
             match client_event {
-                ArchivedEvent::PresentSelf { uuid } => {
+                ArchivedEvent::PresentSelf {
+                    uuid,
+                    readable_name,
+                } => {
                     trace!("Client presenting uuid: {uuid:x?}");
                     let clients = db.open_tree("clients")?;
                     let client_info = if let Some(client_info_bytes) = clients.get(uuid)? {
@@ -216,28 +230,37 @@ async fn process_message(
                         client_info
                     } else {
                         trace!("New client {} {uuid:x?}", state.remote_addr);
-                        let client_info = ClientInfo {
+                        let mut client_info = ClientInfo {
                             uuid: *uuid,
-                            readable_name: state.remote_addr.to_string(),
+                            readable_name: readable_name.to_string(),
                             ..Default::default()
                         };
                         let client_info_bytes = to_bytes::<_, 128>(&client_info)?;
                         clients.insert(uuid, client_info_bytes.as_slice())?;
+                        client_info.readable_name =
+                            format!("'{}'({})", client_info.readable_name, state.remote_addr);
                         client_info
                     };
                     state.info = Some(client_info);
                 }
-                ArchivedEvent::Subscribe { trees } => {
-                    trace!("{} subscribes to {trees:?}", state.remote_addr);
-                    if let Some(info) = &mut state.info {
-                        for tree in trees.iter() {
-                            info.subscribed_to.insert(tree.to_string());
-                        }
-                    }
-                }
                 ArchivedEvent::GetTreeOverview { .. } => {}
                 ArchivedEvent::TreeOverview { tree, records } => {
-                    trace!("Got {}/{tree} overview {records:?}", state.remote_addr);
+                    trace!("Got {}/{tree} overview {records:?}", state.client_name());
+                    let info_key = format!("{tree}_info");
+                    if !db.contains_key(info_key.as_bytes())? {
+                        trace!("New tree {tree}");
+                        ManagedTrees::add_to_managed(db, tree)?;
+                        let tree_info = TreeInfo {
+                            next_key: 0,
+                            ..Default::default()
+                        };
+                        let tree_info_bytes = to_bytes::<_, 0>(&tree_info)?;
+                        db.insert(info_key.as_bytes(), tree_info_bytes.as_slice())?;
+                    }
+                    if let Some(info) = &mut state.info {
+                        info.subscribed_to.insert(tree.to_string());
+                    }
+
                     let removed = removed
                         .read()
                         .await
@@ -266,8 +289,7 @@ async fn process_message(
                     }
                 }
                 ArchivedEvent::GetKeySet { tree } => {
-                    let key_count = 1000;
-                    trace!("{}: GetKeySet for {tree}", state.remote_addr);
+                    trace!("{}: GetKeySet for {tree}", state.client_name());
                     let Some(client_info) = &mut state.info else {
                         return Ok(());
                     };
@@ -280,26 +302,19 @@ async fn process_message(
                             let next_key: u32 = tree_info.next_key;
                             trace!("next_key is {next_key}");
                             let tree_info = TreeInfo {
-                                next_key: next_key + key_count,
+                                next_key: next_key + KEYS_PER_REQUEST,
                                 ..Default::default()
                             };
                             let tree_info_bytes = to_bytes::<_, 0>(&tree_info)?;
                             db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
                             next_key
                         } else {
-                            trace!("New tree {tree}");
-                            ManagedTrees::add_to_managed(db, tree)?;
-                            let tree_info = TreeInfo {
-                                next_key: key_count,
-                                ..Default::default()
-                            };
-                            let tree_info_bytes = to_bytes::<_, 0>(&tree_info)?;
-                            db.insert(key.as_bytes(), tree_info_bytes.as_slice())?;
-                            0u32
+                            error!("No {key} record");
+                            return Ok(());
                         }
                         // }).unwrap();
                     };
-                    let new_range = next_key..next_key + key_count;
+                    let new_range = next_key..next_key + KEYS_PER_REQUEST;
                     let ev = Event::KeySet {
                         tree: tree.to_string(),
                         keys: new_range.clone(),
@@ -319,8 +334,8 @@ async fn process_message(
                         "issued: {}/{}..{} to {}",
                         tree,
                         next_key,
-                        next_key + key_count,
-                        state.remote_addr
+                        next_key + KEYS_PER_REQUEST,
+                        state.client_name()
                     );
                     let ev_bytes = to_bytes::<_, 128>(&ev)?;
                     ws_tx
@@ -333,23 +348,23 @@ async fn process_message(
                 ArchivedEvent::KeySet { .. }
                 | ArchivedEvent::CheckedOut { .. }
                 | ArchivedEvent::AlreadyCheckedOut { .. } => {
-                    warn!("{}: wrong message", state.remote_addr);
+                    warn!("{}: wrong message", state.client_name());
                 }
                 ArchivedEvent::HotSyncEvent(hot_sync_event) => {
                     let Some(client_info) = &state.info else {
-                        error!("Record hot update ignored, because client is not registered yet");
+                        error!("Record update, because client is not registered yet");
                         return Ok(());
                     };
                     let tree_name = hot_sync_event.tree_name.as_str();
                     let key = GenericKey::from_archived(&hot_sync_event.key);
-                    let remote_name = format!("{}", state.remote_addr);
+                    let remote_name = format!("{}", state.client_name());
                     trace!(
-                        "Got hot sync from {remote_name}/{tree_name}/{key}: {}",
+                        "Got sync from {remote_name}/{tree_name}/{key}: {}",
                         hot_sync_event.kind
                     );
                     match hot_sync_event.kind {
-                        ArchivedHotSyncEventKind::Created { .. } => {
-                            if !client_info.owns_key(tree_name, key) {
+                        ArchivedHotSyncEventKind::CreatedOrChanged { meta_iteration, .. } => {
+                            if meta_iteration == 0 && !client_info.owns_key(tree_name, key) {
                                 warn!(
                                     "{} tried to create a record with id {} it doesn't own",
                                     remote_name, key
@@ -377,48 +392,8 @@ async fn process_message(
                         .map_err(|_| Error::PostageBroadcast)?;
                 }
                 ArchivedEvent::RequestRecords { tree, keys } => {
-                    send_records(db, tree.as_str(), keys, &mut ws_tx).await?;
-                }
-                ArchivedEvent::RecordAsRequested {
-                    tree_name,
-                    key,
-                    record,
-                } => {
-                    let tree = db.open_tree(tree_name.as_str())?;
-                    let key = GenericKey::from_archived(key);
-                    let key_bytes = key.to_bytes();
-                    if tree.contains_key(key_bytes)? {
-                        warn!("{tree_name}/{key} already exist");
-                    } else {
-                        tree.insert(key_bytes, record.as_slice())?;
-                        trace!("{tree_name}/{key} inserted");
-
-                        let record = check_archived_root::<Record>(record)?;
-                        let meta: RecordMeta =
-                            record.meta.deserialize(&mut rkyv::Infallible).expect("");
-                        let evolution = record
-                            .data_evolution
-                            .deserialize(&mut rkyv::Infallible)
-                            .expect("");
-                        let data = record.data.to_vec();
-                        let hot_change_ev = HotSyncEvent {
-                            tree_name: tree_name.to_string(),
-                            key,
-                            source_addr: Some(state.remote_addr),
-                            kind: HotSyncEventKind::Created {
-                                meta,
-                                meta_iteration: record.meta_iteration,
-                                data,
-                                data_iteration: record.data_iteration,
-                                data_evolution: evolution,
-                            },
-                        };
-                        broadcast_tx
-                            .send(hot_change_ev)
-                            .await
-                            .map_err(|_| Error::PostageBroadcast)?;
-                        trace!("Relayed cold change to other connected clients");
-                    }
+                    send_records(db, tree.as_str(), keys, &mut ws_tx, Some(state.remote_addr))
+                        .await?;
                 }
             }
         }

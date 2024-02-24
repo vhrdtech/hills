@@ -1,6 +1,6 @@
 use crate::record::RecordMeta;
 use hills_base::{GenericKey, SimpleVersion};
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::SocketAddr;
@@ -28,22 +28,20 @@ pub struct RecordHotChange {
     pub kind: ChangeKind,
 }
 
-#[derive(Archive, Debug, Serialize, Deserialize)]
+#[derive(Archive, Clone, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
 #[archive_attr(derive(Debug))]
 pub enum ChangeKind {
-    Create,
     ModifyMeta,
-    ModifyBoth,
+    CreateOrChange,
     Remove,
 }
 
 impl From<&ArchivedHotSyncEventKind> for ChangeKind {
     fn from(value: &ArchivedHotSyncEventKind) -> Self {
         match value {
-            ArchivedHotSyncEventKind::Created { .. } => ChangeKind::Create,
             ArchivedHotSyncEventKind::MetaChanged { .. } => ChangeKind::ModifyMeta,
-            ArchivedHotSyncEventKind::Changed { .. } => ChangeKind::ModifyBoth,
+            ArchivedHotSyncEventKind::CreatedOrChanged { .. } => ChangeKind::CreateOrChange,
             ArchivedHotSyncEventKind::Removed => ChangeKind::Remove,
         }
     }
@@ -56,9 +54,7 @@ impl From<&ArchivedHotSyncEventKind> for ChangeKind {
 pub enum Event {
     PresentSelf {
         uuid: [u8; 16],
-    },
-    Subscribe {
-        trees: Vec<String>,
+        readable_name: String,
     },
 
     GetTreeOverview {
@@ -72,12 +68,6 @@ pub enum Event {
         tree: String,
         keys: Vec<GenericKey>,
     },
-    RecordAsRequested {
-        tree_name: String,
-        key: GenericKey,
-        record: AlignedVec,
-    },
-
     HotSyncEvent(HotSyncEvent),
 
     GetKeySet {
@@ -94,7 +84,7 @@ pub enum Event {
     },
     Return {
         tree: String,
-        key: Vec<GenericKey>,
+        keys: Vec<GenericKey>,
     },
     CheckedOut {
         tree: String,
@@ -119,19 +109,19 @@ pub struct HotSyncEvent {
 #[derive(Archive, Clone, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub enum HotSyncEventKind {
-    Created {
-        meta: RecordMeta,
-        // Might be non zero when relayed from server after doing cold sync
-        meta_iteration: u32,
-        data: Vec<u8>,
-        data_evolution: SimpleVersion,
-        data_iteration: u32,
-    },
+    // Created {
+    //     meta: RecordMeta,
+    //     // Might be non zero when relayed from server after doing cold sync
+    //     meta_iteration: u32,
+    //     data: Vec<u8>,
+    //     data_evolution: SimpleVersion,
+    //     data_iteration: u32,
+    // },
     MetaChanged {
         meta: RecordMeta,
         meta_iteration: u32,
     },
-    Changed {
+    CreatedOrChanged {
         meta: RecordMeta,
         meta_iteration: u32,
         data: Vec<u8>,
@@ -180,19 +170,14 @@ impl Debug for ArchivedRecordIteration {
 impl Display for ArchivedHotSyncEventKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ArchivedHotSyncEventKind::Created {
-                meta_iteration,
-                data_iteration,
-                ..
-            } => write!(f, "Created m{meta_iteration} d{data_iteration}"),
             ArchivedHotSyncEventKind::MetaChanged { meta_iteration, .. } => {
                 write!(f, "Meta changed m{meta_iteration}")
             }
-            ArchivedHotSyncEventKind::Changed {
+            ArchivedHotSyncEventKind::CreatedOrChanged {
                 meta_iteration,
                 data_iteration,
                 ..
-            } => write!(f, "Changed m{meta_iteration} d{data_iteration}"),
+            } => write!(f, "CreatedOrChanged m{meta_iteration} d{data_iteration}"),
             ArchivedHotSyncEventKind::Removed => write!(f, "Removed"),
         }
     }

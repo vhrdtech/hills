@@ -1,5 +1,5 @@
 use crate::common::ManagedTrees;
-use crate::consts::{KEY_POOL, SELF_UUID};
+use crate::consts::{KEY_POOL, READABLE_NAME, SELF_UUID};
 use crate::index::{TreeIndex, TypeErasedTree};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::opaque::OpaqueKey;
@@ -43,7 +43,7 @@ pub struct HillsClient {
     open_trees: HashMap<String, RawTreeBundle>,
     cmd_tx: VhrdDbCmdTx,
     event_tx: postage::mpsc::Sender<RecordHotChange>,
-    updates_tx: postage::mpsc::Sender<ChangeNotification>,
+    updates_tx: postage::broadcast::Sender<ChangeNotification>,
     pub telem: VhrdDbTelem,
 }
 
@@ -68,7 +68,7 @@ pub struct TypedTree<K, V> {
     /// Notifications to server
     event_tx: postage::mpsc::Sender<RecordHotChange>,
     /// Notifications to user
-    updates_tx: postage::mpsc::Sender<ChangeNotification>,
+    updates_tx: postage::broadcast::Sender<ChangeNotification>,
 
     indexers: Vec<Box<dyn TreeIndex>>,
 
@@ -177,7 +177,7 @@ impl HillsClient {
     ) -> Result<
         (
             HillsClient,
-            postage::mpsc::Receiver<ChangeNotification>,
+            postage::broadcast::Receiver<ChangeNotification>,
             JoinHandle<()>,
         ),
         Error,
@@ -195,6 +195,7 @@ impl HillsClient {
                 }
                 let mut uuid = [0u8; 16];
                 uuid[..].copy_from_slice(&uuid_bytes);
+                trace!("Self uuid is {uuid:?}");
                 Uuid::from_bytes(uuid)
             }
             None => {
@@ -208,7 +209,7 @@ impl HillsClient {
 
         let (tx, rx) = postage::mpsc::channel(64);
         let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
-        let (updates_tx, updates_rx) = postage::mpsc::channel(64);
+        let (updates_tx, updates_rx) = postage::broadcast::channel(64);
         let (cmd_tx, telem, syncer_join) = sync_handle.start(rt, updates_tx.clone());
         Ok((
             HillsClient {
@@ -224,6 +225,19 @@ impl HillsClient {
             updates_rx,
             syncer_join,
         ))
+    }
+
+    pub fn set_readable_name(&mut self, name: impl AsRef<str>) -> Result<(), Error> {
+        if let Some(existing) = self.db.get(READABLE_NAME)? {
+            let existing = std::str::from_utf8(&existing).unwrap_or("");
+            if existing != name.as_ref() {
+                self.db.insert(READABLE_NAME, name.as_ref())?;
+            }
+        } else {
+            self.db.insert(READABLE_NAME, name.as_ref())?;
+        }
+        trace!("Self readable name is {}", name.as_ref());
+        Ok(())
     }
 
     pub fn open_tree<K, V>(&mut self, username: impl AsRef<str>) -> Result<TypedTree<K, V>, Error>
@@ -519,7 +533,7 @@ where
         let change = RecordHotChange {
             tree: String::from(self.tree_name.as_str()),
             key: generic_key,
-            kind: ChangeKind::Create,
+            kind: ChangeKind::CreateOrChange,
             data_iteration: 0,
             meta_iteration: 0,
         };
@@ -529,7 +543,7 @@ where
 
         let notification = ChangeNotification::Tree {
             key: OpaqueKey::new(self.tree_name.clone(), generic_key),
-            kind: ChangeKind::Create,
+            kind: ChangeKind::CreateOrChange,
         };
         if let Err(_) = self.updates_tx.try_send(notification) {
             warn!("Notification send: mpsc fail");
@@ -622,7 +636,7 @@ where
                 key: generic_key,
                 meta_iteration: record.meta_iteration,
                 data_iteration: record.data_iteration,
-                kind: ChangeKind::ModifyBoth,
+                kind: ChangeKind::CreateOrChange,
             };
             self.event_tx
                 .blocking_send(change)
@@ -630,7 +644,7 @@ where
 
             let notification = ChangeNotification::Tree {
                 key: OpaqueKey::new(self.tree_name.clone(), generic_key),
-                kind: ChangeKind::ModifyBoth,
+                kind: ChangeKind::CreateOrChange,
             };
             if let Err(_) = self.updates_tx.try_send(notification) {
                 warn!("Notification send: mpsc fail");

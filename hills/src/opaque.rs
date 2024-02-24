@@ -10,7 +10,7 @@ use ron::ser::PrettyConfig;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OpaqueKey {
     pub tree_name: Arc<String>,
     pub id: u32,

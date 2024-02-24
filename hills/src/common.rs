@@ -1,5 +1,4 @@
 use crate::consts::MANAGED_TREES;
-use log::trace;
 use rkyv::ser::serializers::{
     AllocScratchError, CompositeSerializerError, SharedSerializeMapError,
 };
@@ -73,7 +72,6 @@ impl ManagedTrees {
                     trees.trees.insert(tree_name.to_string());
                     let trees_bytes = to_bytes::<_, 128>(&trees)?;
                     db.insert(MANAGED_TREES, trees_bytes.as_slice())?;
-                    trace!("Adding new");
                 }
             }
             None => {

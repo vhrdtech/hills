@@ -1,5 +1,5 @@
 use crate::common::{Error, ManagedTrees};
-use crate::consts::{KEY_POOL, SELF_UUID};
+use crate::consts::{KEY_POOL, READABLE_NAME, SELF_UUID};
 use crate::index::{Action, TreeIndex, TypeErasedTree};
 use crate::record::{Record, RecordMeta};
 use crate::sync::{
@@ -27,7 +27,15 @@ pub async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) -> Res
     }
     let mut uuid = [0u8; 16];
     uuid[..].copy_from_slice(&uuid_bytes);
-    let id_event = Event::PresentSelf { uuid };
+    let readable_name = if let Some(name) = db.get(READABLE_NAME)? {
+        std::str::from_utf8(&name).unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let id_event = Event::PresentSelf {
+        uuid,
+        readable_name,
+    };
     let id_event = to_bytes::<_, 8>(&id_event)?;
     tx.feed(Message::Binary(id_event.to_vec()))
         .await
@@ -53,7 +61,7 @@ pub async fn send_hot_change(
     );
     let tree = db.open_tree(change.tree.as_str())?;
     let hot_change_ev = match change.kind {
-        ChangeKind::Create | ChangeKind::ModifyMeta | ChangeKind::ModifyBoth => {
+        ChangeKind::ModifyMeta | ChangeKind::CreateOrChange => {
             let Some(record_bytes) = tree.get(change.key.to_bytes())? else {
                 error!(
                     "send_hot_change for {}/{}: record do not actually exist",
@@ -63,39 +71,20 @@ pub async fn send_hot_change(
             };
             let record = check_archived_root::<Record>(&record_bytes)?;
             let meta: RecordMeta = record.meta.deserialize(&mut rkyv::Infallible).expect("");
-            let evolution = record
-                .data_evolution
-                .deserialize(&mut rkyv::Infallible)
-                .expect("");
             match change.kind {
-                ChangeKind::Create | ChangeKind::ModifyBoth => {
+                ChangeKind::CreateOrChange => {
                     let data = record.data.to_vec();
-                    match change.kind {
-                        ChangeKind::Create => HotSyncEvent {
-                            tree_name: change.tree,
-                            key: change.key,
-                            source_addr,
-                            kind: HotSyncEventKind::Created {
-                                meta,
-                                meta_iteration: 0,
-                                data,
-                                data_iteration: 0,
-                                data_evolution: evolution,
-                            },
+                    HotSyncEvent {
+                        tree_name: change.tree,
+                        key: change.key,
+                        source_addr,
+                        kind: HotSyncEventKind::CreatedOrChanged {
+                            meta,
+                            meta_iteration: record.meta_iteration,
+                            data,
+                            data_iteration: record.data_iteration,
+                            data_evolution: record.data_evolution.as_original(),
                         },
-                        ChangeKind::ModifyBoth => HotSyncEvent {
-                            tree_name: change.tree,
-                            key: change.key,
-                            source_addr,
-                            kind: HotSyncEventKind::Changed {
-                                meta,
-                                meta_iteration: record.meta_iteration,
-                                data,
-                                data_iteration: record.data_iteration,
-                                data_evolution: evolution,
-                            },
-                        },
-                        _ => unreachable!(),
                     }
                 }
                 ChangeKind::ModifyMeta => HotSyncEvent {
@@ -255,63 +244,9 @@ pub fn handle_incoming_record(
     let key_bytes = key.to_bytes();
     let db_tree = db.open_tree(tree_name)?;
     match &ev.kind {
-        ArchivedHotSyncEventKind::Created {
-            meta,
-            data,
-            meta_iteration,
-            data_iteration,
-            data_evolution,
-        } => {
-            if db_tree.contains_key(key_bytes)? {
-                trace!(
-                    "{} record {}/{} ignored, because it exists already",
-                    remote_name,
-                    tree_name,
-                    key
-                );
-            } else {
-                let data_evolution = data_evolution.deserialize(&mut rkyv::Infallible).expect("");
-
-                let mut new_data = AlignedVec::new();
-                new_data.extend_from_slice(data.as_slice());
-                if let Some(indexers) = indexers {
-                    if let Some(indexers) = indexers.get_mut(tree_name) {
-                        for indexer in indexers {
-                            if let Err(e) = indexer.update(
-                                TypeErasedTree {
-                                    tree: &db_tree,
-                                    evolution: data_evolution,
-                                },
-                                key,
-                                &new_data,
-                                Action::Insert,
-                            ) {
-                                error!("indexer failed on hot sync on creation, {tree_name}:{key} {e:?}");
-                            }
-                        }
-                    }
-                }
-                let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
-                let record = Record {
-                    meta_iteration: *meta_iteration,
-                    meta,
-                    data_iteration: *data_iteration,
-                    data: new_data,
-                    data_evolution,
-                };
-                let record_bytes = to_bytes::<_, 128>(&record)?;
-                db_tree.insert(key_bytes, record_bytes.as_slice())?;
-                trace!("{} created record {}/{}", remote_name, tree_name, key);
-            }
-        }
         ArchivedHotSyncEventKind::MetaChanged {
             meta,
             meta_iteration,
-        }
-        | ArchivedHotSyncEventKind::Changed {
-            meta,
-            meta_iteration,
-            ..
         } => {
             let Some(record) = db_tree.get(key_bytes)? else {
                 error!(
@@ -322,46 +257,46 @@ pub fn handle_incoming_record(
             };
             let old_record = check_archived_root::<Record>(&record)?;
             let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
-            let data_evolution = old_record
-                .data_evolution
-                .deserialize(&mut rkyv::Infallible)
-                .expect("");
 
-            match &ev.kind {
-                ArchivedHotSyncEventKind::MetaChanged { .. } => {
-                    if *meta_iteration <= old_record.meta_iteration {
-                        trace!(
-                            "{remote_name} update meta {tree_name}/{key} ignored, because it's iteration is {meta_iteration} and this db have {}",
-                            old_record.meta_iteration,
-                        );
-                        return Ok(());
-                    }
-                    let mut old_data = AlignedVec::new();
-                    old_data.extend_from_slice(old_record.data.as_slice());
-                    let record = Record {
-                        meta_iteration: *meta_iteration,
-                        meta,
-                        data_iteration: old_record.data_iteration,
-                        data: old_data,
-                        data_evolution,
-                    };
-                    let record_bytes = to_bytes::<_, 128>(&record)?;
-                    db_tree.insert(key_bytes, record_bytes.as_slice())?;
-                    trace!(
-                        "{} updated meta {}/{} m.it{}->{}",
-                        remote_name,
-                        tree_name,
-                        key,
-                        old_record.meta_iteration,
-                        meta_iteration
-                    );
-                }
-                ArchivedHotSyncEventKind::Changed {
-                    data,
-                    data_iteration,
-                    data_evolution,
-                    ..
-                } => {
+            if *meta_iteration <= old_record.meta_iteration {
+                trace!(
+                    "{remote_name} update meta {tree_name}/{key} ignored, because it's iteration is {meta_iteration} and this db have {}",
+                    old_record.meta_iteration,
+                );
+                return Ok(());
+            }
+            let mut old_data = AlignedVec::new();
+            old_data.extend_from_slice(old_record.data.as_slice());
+            let record = Record {
+                meta_iteration: *meta_iteration,
+                meta,
+                data_iteration: old_record.data_iteration,
+                data: old_data,
+                data_evolution: old_record.data_evolution.as_original(),
+            };
+            let record_bytes = to_bytes::<_, 128>(&record)?;
+            db_tree.insert(key_bytes, record_bytes.as_slice())?;
+            trace!(
+                "{} updated meta {}/{} m.it{}->{}",
+                remote_name,
+                tree_name,
+                key,
+                old_record.meta_iteration,
+                meta_iteration
+            );
+        }
+        ArchivedHotSyncEventKind::CreatedOrChanged {
+            meta,
+            meta_iteration,
+            data,
+            data_evolution,
+            data_iteration,
+        } => {
+            let data_evolution = data_evolution.as_original();
+            match db_tree.get(key_bytes)? {
+                Some(existing_record) => {
+                    let old_record = check_archived_root::<Record>(&existing_record)?;
+
                     if *meta_iteration <= old_record.meta_iteration
                         || *data_iteration <= old_record.data_iteration
                     {
@@ -372,8 +307,6 @@ pub fn handle_incoming_record(
                         );
                         return Ok(());
                     }
-                    let data_evolution =
-                        data_evolution.deserialize(&mut rkyv::Infallible).expect("");
 
                     let mut new_data = AlignedVec::new();
                     new_data.extend_from_slice(data.as_slice());
@@ -389,14 +322,13 @@ pub fn handle_incoming_record(
                                     &new_data,
                                     Action::Update,
                                 ) {
-                                    error!(
-                                        "indexer failed on hot sync on change, {tree_name}:{key} {e:?}"
-                                    );
+                                    error!("indexer failed on CreatedOrChanged, {tree_name}:{key} {e:?}");
                                 }
                             }
                         }
                     }
 
+                    let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
                     let record = Record {
                         meta_iteration: *meta_iteration,
                         meta,
@@ -415,7 +347,38 @@ pub fn handle_incoming_record(
                         data_iteration
                     );
                 }
-                _ => unreachable!(),
+                None => {
+                    let mut new_data = AlignedVec::new();
+                    new_data.extend_from_slice(data.as_slice());
+                    if let Some(indexers) = indexers {
+                        if let Some(indexers) = indexers.get_mut(tree_name) {
+                            for indexer in indexers {
+                                if let Err(e) = indexer.update(
+                                    TypeErasedTree {
+                                        tree: &db_tree,
+                                        evolution: data_evolution,
+                                    },
+                                    key,
+                                    &new_data,
+                                    Action::Insert,
+                                ) {
+                                    error!("indexer failed on hot sync on creation, {tree_name}:{key} {e:?}");
+                                }
+                            }
+                        }
+                    }
+                    let meta: RecordMeta = meta.deserialize(&mut rkyv::Infallible).expect("");
+                    let record = Record {
+                        meta_iteration: *meta_iteration,
+                        meta,
+                        data_iteration: *data_iteration,
+                        data: new_data,
+                        data_evolution,
+                    };
+                    let record_bytes = to_bytes::<_, 128>(&record)?;
+                    db_tree.insert(key_bytes, record_bytes.as_slice())?;
+                    trace!("{} created record {}/{}", remote_name, tree_name, key);
+                }
             }
         }
         ArchivedHotSyncEventKind::Removed => match db_tree.get(key_bytes)? {
@@ -462,6 +425,7 @@ pub async fn send_records(
     tree_name: impl AsRef<str>,
     keys: &ArchivedVec<ArchivedGenericKey>,
     ws_tx: &mut (impl Sink<Message> + Unpin),
+    source_addr: Option<SocketAddr>,
 ) -> Result<(), Error> {
     let tree_name = tree_name.as_ref();
     let tree = db.open_tree(tree_name)?;
@@ -472,13 +436,20 @@ pub async fn send_records(
             warn!("send_records: {key} do not actually exist");
             continue;
         };
-        let mut record = AlignedVec::new();
-        record.extend_from_slice(&record_bytes);
-        let ev = Event::RecordAsRequested {
+        let record = check_archived_root::<Record>(&record_bytes)?;
+        let meta: RecordMeta = record.meta.deserialize(&mut rkyv::Infallible).expect("");
+        let ev = Event::HotSyncEvent(HotSyncEvent {
             tree_name: tree_name.to_string(),
             key,
-            record,
-        };
+            source_addr,
+            kind: HotSyncEventKind::CreatedOrChanged {
+                meta,
+                meta_iteration: record.meta_iteration,
+                data: record.data.to_vec(),
+                data_evolution: record.data_evolution.as_original(),
+                data_iteration: record.data_iteration,
+            },
+        });
         let ev_bytes = to_bytes::<_, 128>(&ev)?;
         ws_tx
             .send(Message::Binary(ev_bytes.to_vec()))

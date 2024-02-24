@@ -1,9 +1,8 @@
 use crate::common::{Error, ManagedTrees};
 use crate::handle_result;
-use crate::index::{Action, TreeIndex, TypeErasedTree};
+use crate::index::TreeIndex;
 use crate::key_pool::KeyPool;
 use crate::opaque::OpaqueKey;
-use crate::record::Record;
 use crate::sync::{ArchivedEvent, ChangeKind, Event, RecordHotChange};
 use crate::sync_common::{
     compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
@@ -17,7 +16,7 @@ use hills_base::GenericKey;
 use log::{error, info, trace, warn};
 use postage::mpsc::{channel, Receiver, Sender};
 use postage::prelude::Stream;
-use rkyv::{check_archived_root, to_bytes, Deserialize};
+use rkyv::{check_archived_root, to_bytes};
 use sled::Db;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -31,7 +30,7 @@ pub struct VhrdDbSyncHandle {
     event_rx: Receiver<RecordHotChange>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ChangeNotification {
     Tree { key: OpaqueKey, kind: ChangeKind },
     Borrowed,
@@ -45,7 +44,7 @@ impl VhrdDbSyncHandle {
     pub(crate) fn start(
         self,
         rt: &Runtime,
-        updates_tx: Sender<ChangeNotification>,
+        updates_tx: postage::broadcast::Sender<ChangeNotification>,
     ) -> (Sender<SyncClientCommand>, VhrdDbTelem, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = channel(64);
         let telem = SyncClientTelemetry::default();
@@ -89,7 +88,7 @@ async fn event_loop(
     mut db: Db,
     mut event_rx: Receiver<RecordHotChange>,
     mut cmd_rx: Receiver<SyncClientCommand>,
-    mut updates_tx: Sender<ChangeNotification>,
+    mut updates_tx: postage::broadcast::Sender<ChangeNotification>,
     telem: VhrdDbTelem,
 ) {
     let mut ws_txrx: Option<(SplitSink<_, _>, SplitStream<_>)> = None;
@@ -114,10 +113,9 @@ async fn event_loop(
                                         continue
                                     };
                                     match ev {
-                                        ArchivedEvent::PresentSelf { uuid } => {
+                                        ArchivedEvent::PresentSelf { uuid, .. } => {
                                             trace!("Server uuid is: {uuid:x?}");
                                         }
-                                        ArchivedEvent::Subscribe { .. } => {}
                                         ArchivedEvent::GetTreeOverview { .. } => {}
                                         ArchivedEvent::TreeOverview { tree, records } => {
                                             trace!("Got {tree} overview {records:?}");
@@ -162,61 +160,8 @@ async fn event_loop(
                                             warn!("Unsupported event from server");
                                         }
                                         ArchivedEvent::RequestRecords { tree, keys } => {
-                                            if let Err(e) = send_records(&db, tree.as_str(), keys, ws_tx).await {
+                                            if let Err(e) = send_records(&db, tree.as_str(), keys, ws_tx, None).await {
                                                 error!("send_records: {e:?}");
-                                            }
-                                        }
-                                        ArchivedEvent::RecordAsRequested {
-                                            tree_name,
-                                            key,
-                                            record,
-                                        } => {
-                                            let Ok(tree) = db.open_tree(tree_name.as_str()) else {
-                                                error!("open tree {tree_name} failed");
-                                                continue
-                                            };
-                                            let key = GenericKey::from_archived(key);
-                                            let key_bytes = key.to_bytes();
-                                            let Ok(contains) = tree.contains_key(key_bytes) else {
-                                                error!("record as requested: contains_key failed");
-                                                continue
-                                            };
-                                            if contains {
-                                                warn!("record as requested: {tree_name}/{key} already exist");
-                                            } else {
-                                                let Ok(archived_record) = check_archived_root::<Record>(&record) else {
-                                                    error!("record as requested unarchive failed");
-                                                    continue;
-                                                };
-                                                let data_evolution = archived_record
-                                                    .data_evolution
-                                                    .deserialize(&mut rkyv::Infallible)
-                                                    .expect("");
-                                                if let Some(indexers) = indexers.get_mut(tree_name.as_str()) {
-                                                    for indexer in indexers {
-                                                        let r = indexer.update(
-                                                            TypeErasedTree {
-                                                                tree: &tree,
-                                                                evolution: data_evolution,
-                                                            },
-                                                            key,
-                                                            archived_record.data.as_slice(),
-                                                            Action::Insert,
-                                                        );
-                                                        if r.is_err() {
-                                                            error!("indexer failed on requested record creation, {tree_name}:{key}");
-                                                        }
-                                                    }
-                                                }
-                                                tree.insert(key_bytes, record.as_slice()).unwrap();
-                                                trace!("{tree_name}/{key} inserted");
-                                                let notification = ChangeNotification::Tree {
-                                                    key: OpaqueKey::new(Arc::new(tree_name.to_string()), key),
-                                                    kind: ChangeKind::Create,
-                                                };
-                                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, notification).await {
-                                                    warn!("Notification send: mpsc fail");
-                                                }
                                             }
                                         }
                                     }
@@ -294,9 +239,9 @@ async fn event_loop(
                             let (mut ws_tx, ws_rx) = ws_stream.split();
                             let r = present_self(&db, &mut ws_tx).await;
                             handle_result!(r);
-                            let r = request_keys(&db, &mut ws_tx).await;
-                            handle_result!(r);
                             let r = send_tree_overviews(&db, &mut ws_tx).await;
+                            handle_result!(r);
+                            let r = request_keys(&db, &mut ws_tx).await;
                             handle_result!(r);
                             ws_txrx = Some((ws_tx, ws_rx));
                         }
