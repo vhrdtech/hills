@@ -84,8 +84,8 @@ pub enum Error {
     #[error("Tree {} not found", .0)]
     TreeNotFound(String),
 
-    #[error("check_archived_root failed")]
-    RkyvCheckArchivedRoot,
+    #[error("check_archived_root failed: {}", .0)]
+    RkyvCheckArchivedRoot(String),
 
     #[error("rkyv serialize: {}", .0)]
     RkyvSerializeError(String),
@@ -114,8 +114,8 @@ pub enum Error {
     #[error("Provided key is not in the tree")]
     RecordNotFound,
 
-    #[error("Indexer rejected a record: {}", .0)]
-    IndexReject(String),
+    #[error(transparent)]
+    Index(#[from] hills_base::index::IndexError),
 }
 
 impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializeMapError>>
@@ -130,7 +130,7 @@ impl From<CompositeSerializerError<Infallible, AllocScratchError, SharedSerializ
 
 impl<T: Debug> From<CheckArchiveError<T, DefaultValidatorError>> for Error {
     fn from(value: CheckArchiveError<T, DefaultValidatorError>) -> Self {
-        Error::RkyvDeserializeError(format!("{value:?}"))
+        Error::RkyvCheckArchivedRoot(format!("{value:?}"))
     }
 }
 

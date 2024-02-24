@@ -439,6 +439,7 @@ dependencies = [
  "chrono",
  "rkyv",
  "serde",
+ "thiserror",
 ]
 
 [[package]]

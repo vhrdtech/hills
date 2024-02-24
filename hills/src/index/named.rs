@@ -3,13 +3,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use hills_base::GenericKey;
+use hills_base::{index::IndexError, GenericKey};
 
 use crate::db::Error;
 
 use super::{Action, TreeIndex, TypeErasedTree};
 
-type ExtractStrFn = fn(data: &[u8]) -> String;
+type ExtractStrFn = fn(data: &[u8]) -> Result<String, IndexError>;
 
 #[derive(Clone)]
 pub struct NamedIndex {
@@ -31,19 +31,13 @@ struct NamedIndexer {
 impl TreeIndex for NamedIndexer {
     fn rebuild(&mut self, tree: TypeErasedTree) -> Result<(), Error> {
         let Ok(mut wr) = self.storage.write() else {
-            return Err(Error::Internal("RwLock fail".to_string()));
+            return Err(Error::Index(IndexError::RwLock));
         };
         wr.index.clear();
         for key in tree.all_revisions() {
-            let s = tree.get_with(key, |data| {
-                let s = (self.extractor)(data);
-                s
-            })?;
-            if s.is_empty() {
-                return Err(Error::IndexReject("Empty name".to_string()));
-            }
+            let s = tree.get_with(key, |data| (self.extractor)(data))??;
             if wr.index.contains_key(&s) {
-                return Err(Error::IndexReject(format!("Duplicate {s}")));
+                return Err(Error::Index(IndexError::Duplicate(s)));
             }
             wr.index.insert(s, key);
         }
@@ -59,16 +53,13 @@ impl TreeIndex for NamedIndexer {
         action: Action,
     ) -> Result<(), Error> {
         let Ok(mut wr) = self.storage.write() else {
-            return Err(Error::Internal("RwLock fail".to_string()));
+            return Err(Error::Index(IndexError::RwLock));
         };
         match action {
             Action::Insert => {
-                let s = (self.extractor)(data);
-                if s.is_empty() {
-                    return Err(Error::IndexReject("Empty name".to_string()));
-                }
+                let s = (self.extractor)(data)?;
                 if wr.index.contains_key(&s) {
-                    return Err(Error::IndexReject(format!("Duplicate {s}")));
+                    return Err(Error::Index(IndexError::Duplicate(s)));
                 }
                 wr.index.insert(s, key);
             }
@@ -79,22 +70,21 @@ impl TreeIndex for NamedIndexer {
                     .find(|(_, v)| **v == key)
                     .map(|(k, _)| k.to_string())
                 else {
-                    return Err(Error::IndexReject("old name not found".to_string()));
+                    return Err(Error::Index(IndexError::Other(
+                        "old name not found".to_string(),
+                    )));
                 };
-                let new_name = (self.extractor)(data);
-                if new_name.is_empty() {
-                    return Err(Error::IndexReject("Empty name".to_string()));
-                }
+                let new_name = (self.extractor)(data)?;
                 if old_name != new_name {
                     if wr.index.contains_key(&new_name) {
-                        return Err(Error::IndexReject(format!("Duplicate {new_name}")));
+                        return Err(Error::Index(IndexError::Duplicate(new_name)));
                     }
                     wr.index.remove(&old_name);
                     wr.index.insert(new_name, key);
                 }
             }
             Action::Remove => {
-                let s = (self.extractor)(data);
+                let s = (self.extractor)(data)?;
                 wr.index.remove(&s);
             }
         }

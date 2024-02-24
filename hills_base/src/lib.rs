@@ -1,6 +1,7 @@
 pub mod date_time;
 pub mod evolution_check;
 pub mod generic_key;
+pub mod index;
 pub mod simple_ast;
 pub mod simple_version;
 

@@ -7,3 +7,4 @@ edition = "2021"
 rkyv = { workspace = true }
 chrono = { workspace = true }
 serde = { version = "1.0.195", features = ["derive"] }
+thiserror = "1.0"
