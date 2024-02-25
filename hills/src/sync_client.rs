@@ -1,4 +1,5 @@
 use crate::common::{Error, ManagedTrees};
+use crate::consts::SERVER_UUID;
 use crate::handle_result;
 use crate::index::TreeIndex;
 use crate::key_pool::KeyPool;
@@ -24,6 +25,7 @@ use std::sync::{Arc, RwLock};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 pub struct VhrdDbSyncHandle {
     db: Db,
@@ -95,6 +97,20 @@ async fn event_loop(
     // let mut to_replay = Vec::new();
     let mut indexers: HashMap<String, Vec<Box<dyn TreeIndex + Send>>> = HashMap::new();
 
+    let mut server_uuid = match db.get(SERVER_UUID) {
+        Ok(Some(uuid_bytes)) => {
+            if uuid_bytes.len() != 16 {
+                None
+            } else {
+                let mut uuid = [0u8; 16];
+                uuid[..].copy_from_slice(&uuid_bytes);
+                trace!("Server uuid must be {uuid:?}");
+                Some(Uuid::from_bytes(uuid))
+            }
+        }
+        _ => None,
+    };
+
     loop {
         let mut should_disconnect = false;
         if let Some((ws_tx, ws_rx)) = &mut ws_txrx {
@@ -115,6 +131,31 @@ async fn event_loop(
                                     match ev {
                                         ArchivedEvent::PresentSelf { uuid, .. } => {
                                             trace!("Server uuid is: {uuid:x?}");
+                                            let uuid = Uuid::from_bytes(*uuid);
+                                            match server_uuid {
+                                                Some(server_uuid) => {
+                                                    if server_uuid == uuid {
+                                                        let r = present_self(&db, ws_tx).await;
+                                                        handle_result!(r);
+                                                        let r = send_tree_overviews(&db, ws_tx).await;
+                                                        handle_result!(r);
+                                                        let r = request_keys(&db, ws_tx).await;
+                                                        handle_result!(r);
+                                                    } else {
+                                                        if let Ok(mut wr) = telem.write() {
+                                                            wr.error_message = "Server UUID does not match with the current database".to_string();
+                                                            warn!("{}", wr.error_message);
+                                                        }
+                                                        should_disconnect = true;
+                                                    }
+                                                }
+                                                None => {
+                                                    server_uuid = Some(uuid);
+                                                    let uuid_bytes = uuid.into_bytes();
+                                                    let r = db.insert(SERVER_UUID, &uuid_bytes);
+                                                    info!("Linking this database with connected server: {r:?}");
+                                                }
+                                            }
                                         }
                                         ArchivedEvent::GetTreeOverview { .. } => {}
                                         ArchivedEvent::TreeOverview { tree, records } => {
@@ -236,14 +277,7 @@ async fn event_loop(
                                     continue;
                                 }
                             };
-                            let (mut ws_tx, ws_rx) = ws_stream.split();
-                            let r = present_self(&db, &mut ws_tx).await;
-                            handle_result!(r);
-                            let r = send_tree_overviews(&db, &mut ws_tx).await;
-                            handle_result!(r);
-                            let r = request_keys(&db, &mut ws_tx).await;
-                            handle_result!(r);
-                            ws_txrx = Some((ws_tx, ws_rx));
+                            ws_txrx = Some(ws_stream.split());
                         }
                         SyncClientCommand::Disconnect => {}
                         SyncClientCommand::TreeCreated(_tree_name) => {

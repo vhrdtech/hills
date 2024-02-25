@@ -15,7 +15,12 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let server = HillsServer::start("server_play_db", "0.0.0.0:7070", &runtime)?;
+    let mut args = std::env::args();
+    let _ = args.next();
+    let db_name = args.next().unwrap();
+    let db_path = std::path::Path::new(&db_name);
+
+    let server = HillsServer::start(db_path, "0.0.0.0:7070", &runtime)?;
     runtime.block_on(server.join)?;
     Ok(())
 }
