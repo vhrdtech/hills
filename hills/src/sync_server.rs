@@ -1,6 +1,8 @@
 use crate::common::{Error, ManagedTrees};
 use crate::consts::{KEYS_PER_REQUEST, SELF_UUID};
-use crate::sync::{ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind};
+use crate::sync::{
+    ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind, RecordBorrows,
+};
 use crate::sync_common::{
     compare_and_request_missing_records, present_self, send_records, send_tree_overviews,
 };
@@ -75,10 +77,11 @@ impl State {
     }
 }
 
-// struct RecordBorrows {
-//     /// tree name -> key -> queue of clients
-//     borrows: HashMap<String, HashMap<GenericKey, Vec<Uuid>>>,
-// }
+#[derive(Clone)]
+enum BroadcastEvent {
+    Sync(HotSyncEvent),
+    BorrowsChanged(String, Vec<GenericKey>),
+}
 
 impl HillsServer {
     pub fn start<P: AsRef<Path>, A: ToSocketAddrs + Send + 'static>(
@@ -112,6 +115,7 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
     let (broadcast_tx, broadcast_rx) = postage::broadcast::channel(256);
     drop(broadcast_rx);
     let removed = Arc::new(RwLock::new(HashMap::new()));
+    let borrows = Arc::new(RwLock::new(RecordBorrows::default()));
     loop {
         match listener.accept().await {
             Ok((tcp_stream, remote_addr)) => {
@@ -134,8 +138,12 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
                 let rx = broadcast_tx.subscribe();
                 let tx = broadcast_tx.clone();
                 let removed = removed.clone();
+                let borrows = borrows.clone();
                 tokio::spawn(async move {
-                    ws_event_loop(ws_sink, ws_source, db_clone, state, rx, tx, removed).await
+                    ws_event_loop(
+                        ws_sink, ws_source, db_clone, state, rx, tx, removed, borrows,
+                    )
+                    .await
                 });
             }
             Err(e) => {
@@ -150,9 +158,10 @@ async fn ws_event_loop(
     mut ws_rx: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
     mut db: Db,
     mut state: State,
-    mut broadcast_rx: postage::broadcast::Receiver<HotSyncEvent>,
-    mut broadcast_tx: postage::broadcast::Sender<HotSyncEvent>,
+    mut broadcast_rx: postage::broadcast::Receiver<BroadcastEvent>,
+    mut broadcast_tx: postage::broadcast::Sender<BroadcastEvent>,
     removed: Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
+    borrows: Arc<RwLock<RecordBorrows>>,
 ) {
     info!("Event loop for {}: started", state.remote_addr);
     let r = present_self(&db, &mut ws_tx).await;
@@ -170,7 +179,7 @@ async fn ws_event_loop(
                         if let Message::Close(_) = &message {
                             break;
                         }
-                        let r = process_message(message, &mut ws_tx, &mut db, &mut state, &mut broadcast_tx, &removed).await;
+                        let r = process_message(message, &mut ws_tx, &mut db, &mut state, &mut broadcast_tx, &removed, &borrows).await;
                         handle_result!(r);
                     }
                     Ok(None) => {
@@ -187,13 +196,42 @@ async fn ws_event_loop(
                     warn!("broadcast_rx returned None {}", state.client_name());
                     continue
                 };
-                // trace!("hot change from {:?} in {} event loop", event.source_addr, state.remote_addr);
-                if event.source_addr != Some(state.remote_addr) {
-                    trace!("relaying event to {}", state.client_name());
-                    let ev_bytes = to_bytes::<_, 128>(&Event::HotSyncEvent(event)).unwrap();
-                    let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
-                    if r.is_err() {
-                        warn!("relay error");
+                match event {
+                    BroadcastEvent::Sync(event) => {
+                        if event.source_addr != Some(state.remote_addr) {
+                            trace!("relaying event to {}", state.client_name());
+                            let Ok(ev_bytes) = to_bytes::<_, 128>(&Event::HotSyncEvent(event)) else {
+                                error!("relay serialize error");
+                                continue;
+                            };
+                            let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
+                            if r.is_err() {
+                                warn!("relay error");
+                            }
+                        }
+                    }
+                    BroadcastEvent::BorrowsChanged(tree, keys) => {
+                        let borrows = &borrows.read().await.borrows;
+                        let Some(borrowed_keys) = borrows.get(tree.as_str()) else {
+                            continue
+                        };
+                        for key in keys {
+                            let Some(queue) = borrowed_keys.get(&key) else {
+                                continue
+                            };
+                            let Ok(ev_bytes) = to_bytes::<_, 128>(&Event::CheckedOut {
+                                tree: tree.as_str().to_string(),
+                                key,
+                                queue: queue.iter().map(|uuid| *uuid.as_bytes()).collect()
+                            }) else {
+                                error!("borrows changed serialize error");
+                                continue
+                            };
+                            let r = ws_tx.send(Message::Binary(ev_bytes.to_vec())).await;
+                            if r.is_err() {
+                                warn!("relay error");
+                            }
+                        }
                     }
                 }
             }
@@ -208,8 +246,9 @@ async fn process_message(
     mut ws_tx: impl Sink<Message> + Unpin,
     db: &mut Db,
     state: &mut State,
-    broadcast_tx: &mut postage::broadcast::Sender<HotSyncEvent>,
+    broadcast_tx: &mut postage::broadcast::Sender<BroadcastEvent>,
     removed: &Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
+    borrows: &Arc<RwLock<RecordBorrows>>,
 ) -> Result<(), Error> {
     use postage::prelude::Sink;
     match ws_message {
@@ -343,11 +382,44 @@ async fn process_message(
                         .await
                         .map_err(|_| Error::Ws)?;
                 }
-                ArchivedEvent::CheckOut { .. } => {}
-                ArchivedEvent::Return { .. } => {}
-                ArchivedEvent::KeySet { .. }
-                | ArchivedEvent::CheckedOut { .. }
-                | ArchivedEvent::AlreadyCheckedOut { .. } => {
+                ArchivedEvent::CheckOut { tree, keys } | ArchivedEvent::Return { tree, keys } => {
+                    let Some(client_info) = &state.info else {
+                        warn!("CheckOut | Return: no client_info");
+                        return Ok(());
+                    };
+                    let uuid = Uuid::from_bytes(client_info.uuid);
+                    let is_checking_out = matches!(client_event, ArchivedEvent::CheckOut { .. });
+                    let borrows = &mut borrows.write().await.borrows;
+                    let borrowed_keys = borrows.entry(tree.as_str().to_string()).or_default();
+                    for key in keys.iter() {
+                        let key = GenericKey::from_archived(key);
+                        let queue = borrowed_keys.entry(key).or_default();
+                        if is_checking_out {
+                            queue.push(uuid);
+                            trace!("CheckOut from {}, queue: {:?}", state.client_name(), queue);
+                        } else {
+                            let is_our_borrow = queue.get(0) == Some(&uuid);
+                            if is_our_borrow {
+                                queue.remove(0);
+                                trace!("Return from {}, queue: {:?}", state.client_name(), queue);
+                            } else {
+                                warn!(
+                                    "Tried returning a record that wasn't borrowed - {}/{key} - internal error",
+                                    tree.as_str()
+                                );
+                            }
+                        }
+                    }
+
+                    broadcast_tx
+                        .send(BroadcastEvent::BorrowsChanged(
+                            tree.to_string(),
+                            keys.iter().map(|k| GenericKey::from_archived(k)).collect(),
+                        ))
+                        .await
+                        .map_err(|_| Error::PostageBroadcast)?;
+                }
+                ArchivedEvent::KeySet { .. } | ArchivedEvent::CheckedOut { .. } => {
                     warn!("{}: wrong message", state.client_name());
                 }
                 ArchivedEvent::HotSyncEvent(hot_sync_event) => {
@@ -387,7 +459,7 @@ async fn process_message(
                         hot_sync_event.deserialize(&mut rkyv::Infallible).expect("");
                     hot_sync_event_owned.source_addr = Some(state.remote_addr);
                     broadcast_tx
-                        .send(hot_sync_event_owned)
+                        .send(BroadcastEvent::Sync(hot_sync_event_owned))
                         .await
                         .map_err(|_| Error::PostageBroadcast)?;
                 }

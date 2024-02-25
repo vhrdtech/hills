@@ -42,6 +42,10 @@ pub trait OpaqueTree {
     fn update_from_ron_str(&mut self, key: &OpaqueKey, value: &str) -> Result<(), Error>;
     fn remove(&mut self, key: &OpaqueKey) -> Result<(), Error>;
 
+    fn is_checked_out(&self, key: &OpaqueKey) -> Result<bool, Error>;
+    fn check_out(&mut self, key: &OpaqueKey) -> Result<(), Error>;
+    fn release(&mut self, key: &OpaqueKey) -> Result<(), Error>;
+
     fn versioning(&self) -> bool;
 }
 
@@ -64,17 +68,7 @@ where
         &self,
         key: &OpaqueKey,
     ) -> Result<Option<(u32, RecordMeta, u32, SimpleVersion)>, Error> {
-        if key.tree_name.as_str() != self.tree_name.as_str() {
-            return Err(Error::Usage(format!(
-                "Tried to use {} key with {} tree",
-                key.tree_name, self.tree_name
-            )));
-        }
-        let key = GenericKey {
-            id: key.id,
-            revision: key.revision,
-        };
-        let key: K = K::from_generic(key);
+        let key = check_key(key, self.tree_name.as_str())?;
         self.meta(key)
     }
 
@@ -103,17 +97,7 @@ where
     }
 
     fn to_ron_str_pretty(&self, key: &OpaqueKey) -> Result<String, Error> {
-        if key.tree_name.as_str() != self.tree_name.as_str() {
-            return Err(Error::Usage(format!(
-                "Tried to use {} key with {} tree",
-                key.tree_name, self.tree_name
-            )));
-        }
-        let key = GenericKey {
-            id: key.id,
-            revision: key.revision,
-        };
-        let key: K = K::from_generic(key);
+        let key = check_key(key, self.tree_name.as_str())?;
         let value = self.get(key)?;
         let s = ron::ser::to_string_pretty(&value, PrettyConfig::default().compact_arrays(true))
             .map_err(|e| Error::Internal(format!("{e:?}")))?;
@@ -126,33 +110,13 @@ where
     }
 
     fn update_from_ron_str(&mut self, key: &OpaqueKey, value: &str) -> Result<(), Error> {
-        if key.tree_name.as_str() != self.tree_name.as_str() {
-            return Err(Error::Usage(format!(
-                "Tried to use {} key with {} tree",
-                key.tree_name, self.tree_name
-            )));
-        }
-        let key = GenericKey {
-            id: key.id,
-            revision: key.revision,
-        };
-        let key: K = K::from_generic(key);
+        let key = check_key(key, self.tree_name.as_str())?;
         let value: V = ron::de::from_str(value).map_err(|e| Error::Internal(format!("{e:?}")))?;
         self.update(key, value)
     }
 
     fn remove(&mut self, key: &OpaqueKey) -> Result<(), Error> {
-        if key.tree_name.as_str() != self.tree_name.as_str() {
-            return Err(Error::Usage(format!(
-                "Tried to use {} key with {} tree",
-                key.tree_name, self.tree_name
-            )));
-        }
-        let key = GenericKey {
-            id: key.id,
-            revision: key.revision,
-        };
-        let key: K = K::from_generic(key);
+        let key = check_key(key, self.tree_name.as_str())?;
         <TypedTree<K, V>>::remove(self, key)?;
         Ok(())
     }
@@ -160,4 +124,35 @@ where
     fn versioning(&self) -> bool {
         V::versioning()
     }
+
+    fn is_checked_out(&self, key: &OpaqueKey) -> Result<bool, Error> {
+        let key = check_key(key, self.tree_name.as_str())?;
+        Ok(<TypedTree<K, V>>::is_checked_out(&self, key))
+    }
+
+    fn check_out(&mut self, key: &OpaqueKey) -> Result<(), Error> {
+        let key = check_key(key, self.tree_name.as_str())?;
+        <TypedTree<K, V>>::check_out(self, key);
+        Ok(())
+    }
+
+    fn release(&mut self, key: &OpaqueKey) -> Result<(), Error> {
+        let key = check_key(key, self.tree_name.as_str())?;
+        <TypedTree<K, V>>::release(self, key);
+        Ok(())
+    }
+}
+
+fn check_key<K: TreeKey>(key: &OpaqueKey, tree_name: &str) -> Result<K, Error> {
+    if key.tree_name.as_str() != tree_name {
+        return Err(Error::Usage(format!(
+            "Tried to use {} key with {} tree",
+            key.tree_name, tree_name
+        )));
+    }
+    let key = GenericKey {
+        id: key.id,
+        revision: key.revision,
+    };
+    Ok(K::from_generic(key))
 }

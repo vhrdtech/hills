@@ -5,17 +5,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::SocketAddr;
 use std::ops::Range;
-
-// pub enum NodeKind {
-//     /// Node gives out mutable locks, accepts changes and serves data for other nodes.
-//     Server,
-//     /// Node talks to a server, produces new data and requests existing one when need be.
-//     Client,
-//     /// Node only receiving data from a server and storing it.
-//     Backup,
-//     /// Node that fully owns database file, no need for borrowing entries for editing.
-//     StandAlone,
-// }
+use uuid::Uuid;
 
 #[derive(Archive, Debug, Serialize, Deserialize)]
 #[archive(check_bytes)]
@@ -88,12 +78,8 @@ pub enum Event {
     },
     CheckedOut {
         tree: String,
-        keys: Vec<GenericKey>,
-    },
-    AlreadyCheckedOut {
-        tree: String,
-        keys: Vec<GenericKey>,
-        by_node: [u8; 16],
+        key: GenericKey,
+        queue: Vec<[u8; 16]>,
     },
 }
 
@@ -109,14 +95,6 @@ pub struct HotSyncEvent {
 #[derive(Archive, Clone, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub enum HotSyncEventKind {
-    // Created {
-    //     meta: RecordMeta,
-    //     // Might be non zero when relayed from server after doing cold sync
-    //     meta_iteration: u32,
-    //     data: Vec<u8>,
-    //     data_evolution: SimpleVersion,
-    //     data_iteration: u32,
-    // },
     MetaChanged {
         meta: RecordMeta,
         meta_iteration: u32,
@@ -136,6 +114,12 @@ pub enum HotSyncEventKind {
 pub struct RecordIteration {
     pub meta_iteration: u32,
     pub data_iteration: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct RecordBorrows {
+    /// tree name -> key -> queue of clients
+    pub(crate) borrows: HashMap<String, HashMap<GenericKey, Vec<Uuid>>>,
 }
 
 impl Display for RecordIteration {

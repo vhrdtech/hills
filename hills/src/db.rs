@@ -5,7 +5,7 @@ use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::opaque::OpaqueKey;
 use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
-use crate::sync::{ChangeKind, RecordHotChange};
+use crate::sync::{ChangeKind, RecordBorrows, RecordHotChange};
 use crate::sync_client::{
     ChangeNotification, SyncClientCommand, SyncClientTelemetry, VhrdDbCmdTx, VhrdDbSyncHandle,
 };
@@ -13,7 +13,7 @@ use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::VhrdDbTelem;
 use chrono::Utc;
 use hills_base::{Evolving, GenericKey, Reflect, SimpleVersion, TreeKey, TreeRoot, TypeCollection};
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use postage::prelude::Sink;
 use rkyv::ser::serializers::{
     AllocScratchError, AllocSerializer, CompositeSerializerError, SharedSerializeMapError,
@@ -33,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -42,8 +43,8 @@ pub struct HillsClient {
     descriptors: Tree,
     open_trees: HashMap<String, RawTreeBundle>,
     cmd_tx: VhrdDbCmdTx,
-    event_tx: postage::mpsc::Sender<RecordHotChange>,
     updates_tx: postage::broadcast::Sender<ChangeNotification>,
+    borrows: Arc<RwLock<RecordBorrows>>,
     pub telem: VhrdDbTelem,
 }
 
@@ -65,12 +66,13 @@ pub struct TypedTree<K, V> {
     username: String,
     versioning: bool,
 
-    /// Notifications to server
-    event_tx: postage::mpsc::Sender<RecordHotChange>,
-    /// Notifications to user
+    /// Notifications to client (internal)
+    cmd_tx: VhrdDbCmdTx,
+    /// Notifications to user (pub)
     updates_tx: postage::broadcast::Sender<ChangeNotification>,
 
     indexers: Vec<Box<dyn TreeIndex>>,
+    borrows: Arc<RwLock<RecordBorrows>>,
 
     _phantom_k: PhantomData<K>,
     _phantom_v: PhantomData<V>,
@@ -207,19 +209,20 @@ impl HillsClient {
             }
         };
 
-        let (tx, rx) = postage::mpsc::channel(64);
-        let sync_handle = VhrdDbSyncHandle::new(db.clone(), rx);
+        let sync_handle = VhrdDbSyncHandle::new(db.clone());
         let (updates_tx, updates_rx) = postage::broadcast::channel(64);
-        let (cmd_tx, telem, syncer_join) = sync_handle.start(rt, updates_tx.clone());
+        let borrows = Arc::new(RwLock::new(RecordBorrows::default()));
+        let (cmd_tx, telem, syncer_join) =
+            sync_handle.start(rt, updates_tx.clone(), borrows.clone());
         Ok((
             HillsClient {
                 db,
                 self_uuid,
                 descriptors,
                 open_trees: HashMap::default(),
-                event_tx: tx,
                 cmd_tx,
                 updates_tx,
+                borrows,
                 telem,
             },
             updates_rx,
@@ -256,10 +259,12 @@ impl HillsClient {
                 username: username.as_ref().to_string(),
                 versioning: raw_tree.versioning,
                 tree_name: Arc::new(tree_name.to_string()),
-                event_tx: self.event_tx.clone(),
+                // event_tx: self.event_tx.clone(),
                 updates_tx: self.updates_tx.clone(),
                 uuid: self.self_uuid,
                 indexers: raw_tree.indexers.clone(),
+                borrows: self.borrows.clone(),
+                cmd_tx: self.cmd_tx.clone(),
 
                 _phantom_k: Default::default(),
                 _phantom_v: Default::default(),
@@ -274,10 +279,12 @@ impl HillsClient {
                     username: username.as_ref().to_string(),
                     versioning,
                     tree_name: Arc::new(tree_name.to_string()),
-                    event_tx: self.event_tx.clone(),
+                    // event_tx: self.event_tx.clone(),
                     updates_tx: self.updates_tx.clone(),
                     uuid: self.self_uuid,
                     indexers: bundle.indexers.clone(),
+                    borrows: self.borrows.clone(),
+                    cmd_tx: self.cmd_tx.clone(),
 
                     _phantom_k: Default::default(),
                     _phantom_v: Default::default(),
@@ -325,6 +332,7 @@ impl HillsClient {
                 tree_name.to_string(),
             ));
         }
+        ManagedTrees::add_to_managed(&self.db, tree_name)?;
 
         let versioning = <V as TreeRoot>::versioning();
         let mut current_tc = TypeCollection::new();
@@ -435,7 +443,7 @@ impl HillsClient {
     }
 
     pub fn telemetry<F: FnMut(&SyncClientTelemetry)>(&self, mut f: F) {
-        if let Ok(telem) = self.telem.read() {
+        if let Ok(telem) = self.telem.try_read() {
             f(&telem);
         }
     }
@@ -537,8 +545,8 @@ where
             data_iteration: 0,
             meta_iteration: 0,
         };
-        self.event_tx
-            .blocking_send(change)
+        self.cmd_tx
+            .blocking_send(SyncClientCommand::Change(change))
             .map_err(|_| Error::Mpsc)?;
 
         let notification = ChangeNotification::Tree {
@@ -554,12 +562,19 @@ where
 
     pub fn update(&mut self, key: K, value: V) -> Result<(), Error> {
         let generic_key = key.to_generic();
+        if !self.is_checked_out(key) {
+            return Err(Error::Usage(format!(
+                "Cannot update: {}/{generic_key} - not checked out",
+                self.tree_name
+            )));
+        }
+
         let key_bytes = generic_key.to_bytes();
         let evolution = <V as TreeRoot>::evolution();
 
         if !self.versioning && generic_key.revision != 0 {
             return Err(Error::Usage(format!(
-                "update {key:?}, on un-versioned tree"
+                "update {generic_key}, on un-versioned tree"
             )));
         }
         if let Some(previous) = generic_key.previous_revision() {
@@ -571,12 +586,13 @@ where
             // }
             let Some(previous_record) = self.data.get(previous)? else {
                 return Err(Error::Internal(format!(
-                    "Previous version of {key:?} is not in the data tree"
+                    "Previous version of {}/{generic_key} is not in the data tree",
+                    self.tree_name
                 )));
             };
             let previous_record = check_archived_root::<Record>(&previous_record)?;
             if matches!(previous_record.meta.version, ArchivedVersion::Draft) {
-                return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {key:?}")));
+                return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {}/{generic_key}", self.tree_name)));
             }
             // self.latest_revision_index.remove(previous)?;
         }
@@ -585,7 +601,8 @@ where
             let replacing = check_archived_root::<Record>(&replacing)?;
             if self.versioning && matches!(replacing.meta.version, ArchivedVersion::Released(_)) {
                 return Err(Error::VersioningMismatch(format!(
-                    "Cannot replace Released record {key:?}"
+                    "Cannot replace Released record {}/{generic_key}",
+                    self.tree_name
                 )));
             }
             let data = to_bytes::<_, 128>(&Evolving(value))?;
@@ -638,8 +655,8 @@ where
                 data_iteration: record.data_iteration,
                 kind: ChangeKind::CreateOrChange,
             };
-            self.event_tx
-                .blocking_send(change)
+            self.cmd_tx
+                .blocking_send(SyncClientCommand::Change(change))
                 .map_err(|_| Error::Mpsc)?;
 
             let notification = ChangeNotification::Tree {
@@ -653,7 +670,8 @@ where
             Ok(())
         } else {
             Err(Error::Usage(format!(
-                "update {key:?}, not found, create record first"
+                "update {}/{generic_key}, not found, create record first",
+                self.tree_name
             )))
         }
     }
@@ -714,6 +732,13 @@ where
 
     pub fn remove(&mut self, key: K) -> Result<Option<()>, Error> {
         let generic_key = key.to_generic();
+        if !self.is_checked_out(key) {
+            return Err(Error::Usage(format!(
+                "Cannot remove: {}/{generic_key} - not checked out",
+                self.tree_name
+            )));
+        }
+
         let key_bytes = generic_key.to_bytes();
         let value = self.data.get(key_bytes)?;
         match value {
@@ -721,9 +746,8 @@ where
                 let archived_record = check_archived_root::<Record>(&bytes)?;
                 if matches!(archived_record.meta.version, ArchivedVersion::Released(_)) {
                     return Err(Error::Usage(format!(
-                        "Cannot remove released record {}/{}",
+                        "Cannot remove released record {}/{generic_key}",
                         self.tree_name,
-                        key.to_generic()
                     )));
                 }
                 for indexer in &mut self.indexers {
@@ -752,8 +776,8 @@ where
                     data_iteration: archived_record.data_iteration,
                     kind: ChangeKind::Remove,
                 };
-                self.event_tx
-                    .blocking_send(change)
+                self.cmd_tx
+                    .blocking_send(SyncClientCommand::Change(change))
                     .map_err(|_| Error::Mpsc)?;
 
                 let notification = ChangeNotification::Tree {
@@ -767,6 +791,39 @@ where
                 Ok(Some(()))
             }
             None => Ok(None),
+        }
+    }
+
+    pub fn check_out(&mut self, key: K) {
+        if let Err(_) = self.cmd_tx.blocking_send(SyncClientCommand::CheckOut(
+            self.tree_name.as_str().to_string(),
+            key.to_generic(),
+        )) {
+            error!("check_out: mpsc error");
+        }
+    }
+
+    pub fn release(&mut self, key: K) {
+        if let Err(_) = self.cmd_tx.blocking_send(SyncClientCommand::Release(
+            self.tree_name.as_str().to_string(),
+            key.to_generic(),
+        )) {
+            error!("check_out: mpsc error");
+        }
+    }
+
+    pub fn is_checked_out(&self, key: K) -> bool {
+        let Ok(rd) = self.borrows.try_read() else {
+            return false;
+        };
+        if let Some(borrowed_keys) = rd.borrows.get(self.tree_name.as_str()) {
+            let key = key.to_generic();
+            match borrowed_keys.get(&key) {
+                Some(queue) => queue.get(0) == Some(&self.uuid),
+                None => false,
+            }
+        } else {
+            false
         }
     }
 

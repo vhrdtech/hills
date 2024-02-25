@@ -4,11 +4,12 @@ use crate::handle_result;
 use crate::index::TreeIndex;
 use crate::key_pool::KeyPool;
 use crate::opaque::OpaqueKey;
-use crate::sync::{ArchivedEvent, ChangeKind, Event, RecordHotChange};
+use crate::sync::{ArchivedEvent, ChangeKind, Event, RecordBorrows, RecordHotChange};
 use crate::sync_common::{
     compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
     send_records, send_tree_overviews,
 };
+use futures_util::Sink;
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt, TryStreamExt,
@@ -21,15 +22,15 @@ use rkyv::{check_archived_root, to_bytes};
 use sled::Db;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 pub struct VhrdDbSyncHandle {
     db: Db,
-    event_rx: Receiver<RecordHotChange>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,22 +40,22 @@ pub enum ChangeNotification {
 }
 
 impl VhrdDbSyncHandle {
-    pub(crate) fn new(db: Db, rx: Receiver<RecordHotChange>) -> Self {
-        Self { db, event_rx: rx }
+    pub(crate) fn new(db: Db) -> Self {
+        Self { db }
     }
 
     pub(crate) fn start(
         self,
         rt: &Runtime,
         updates_tx: postage::broadcast::Sender<ChangeNotification>,
+        borrows: Arc<RwLock<RecordBorrows>>,
     ) -> (Sender<SyncClientCommand>, VhrdDbTelem, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = channel(64);
         let telem = SyncClientTelemetry::default();
         let telem = Arc::new(RwLock::new(telem));
         let telem_2 = telem.clone();
-        let join_handle = rt.spawn(async move {
-            event_loop(self.db, self.event_rx, cmd_rx, updates_tx, telem_2).await
-        });
+        let join_handle = rt
+            .spawn(async move { event_loop(self.db, cmd_rx, updates_tx, telem_2, borrows).await });
 
         (cmd_tx, telem, join_handle)
     }
@@ -68,6 +69,9 @@ pub(crate) enum SyncClientCommand {
         tree_name: String,
         indexer: Box<dyn TreeIndex + Send>,
     },
+    Change(RecordHotChange),
+    CheckOut(String, GenericKey),
+    Release(String, GenericKey),
     // FullReSync,
 }
 
@@ -88,10 +92,10 @@ pub type VhrdDbTelem = Arc<RwLock<SyncClientTelemetry>>;
 
 async fn event_loop(
     mut db: Db,
-    mut event_rx: Receiver<RecordHotChange>,
     mut cmd_rx: Receiver<SyncClientCommand>,
     mut updates_tx: postage::broadcast::Sender<ChangeNotification>,
     telem: VhrdDbTelem,
+    borrows: Arc<RwLock<RecordBorrows>>,
 ) {
     let mut ws_txrx: Option<(SplitSink<_, _>, SplitStream<_>)> = None;
     // let mut to_replay = Vec::new();
@@ -142,10 +146,9 @@ async fn event_loop(
                                                         let r = request_keys(&db, ws_tx).await;
                                                         handle_result!(r);
                                                     } else {
-                                                        if let Ok(mut wr) = telem.write() {
-                                                            wr.error_message = "Server UUID does not match with the current database".to_string();
-                                                            warn!("{}", wr.error_message);
-                                                        }
+                                                        let mut telem = telem.write().await;
+                                                        telem.error_message = "Server UUID does not match with the current database".to_string();
+                                                        warn!("{}", telem.error_message);
                                                         should_disconnect = true;
                                                     }
                                                 }
@@ -153,7 +156,13 @@ async fn event_loop(
                                                     server_uuid = Some(uuid);
                                                     let uuid_bytes = uuid.into_bytes();
                                                     let r = db.insert(SERVER_UUID, &uuid_bytes);
-                                                    info!("Linking this database with connected server: {r:?}");
+                                                    info!("Linking this database with connected server: {}", r.is_ok());
+                                                    let r = present_self(&db, ws_tx).await;
+                                                    handle_result!(r);
+                                                    let r = send_tree_overviews(&db, ws_tx).await;
+                                                    handle_result!(r);
+                                                    let r = request_keys(&db, ws_tx).await;
+                                                    handle_result!(r);
                                                 }
                                             }
                                         }
@@ -175,8 +184,14 @@ async fn event_loop(
                                                 error!("key set: {e:?}");
                                             }
                                         }
-                                        ArchivedEvent::CheckedOut { .. } => {}
-                                        ArchivedEvent::AlreadyCheckedOut { .. } => {}
+                                        ArchivedEvent::CheckedOut { tree, key, queue } => {
+                                            let borrows = &mut borrows.write().await.borrows;
+                                            let borrowed_keys = borrows.entry(tree.as_str().to_string()).or_default();
+                                            let queue = queue.iter().map(|uuid| Uuid::from_bytes(*uuid)).collect();
+                                            let key = GenericKey::from_archived(key);
+                                            trace!("Now checked out for {}/{}: {:?}", tree.as_str(), key, queue);
+                                            borrowed_keys.insert(key, queue);
+                                        }
                                         ArchivedEvent::HotSyncEvent(hot_sync_event) => {
                                             let tree_name = hot_sync_event.tree_name.as_str();
                                             let key = GenericKey::from_archived(&hot_sync_event.key);
@@ -239,13 +254,19 @@ async fn event_loop(
                         SyncClientCommand::RegisterIndex { tree_name, indexer } => {
                             indexers.entry(tree_name).or_default().push(indexer);
                         }
-                    }
-                }
-                event = event_rx.recv() => {
-                    if let Some(event) = event {
-                        trace!("{event:?}");
-                        let r = send_hot_change(&db, event, ws_tx, None).await;
-                        handle_result!(r);
+                        SyncClientCommand::Change(event) => {
+                            trace!("{event:?}");
+                            let r = send_hot_change(&db, event, ws_tx, None).await;
+                            handle_result!(r);
+                        }
+                        SyncClientCommand::CheckOut(tree, key) => {
+                            let r = check_out(tree, key, ws_tx).await;
+                            handle_result!(r);
+                        },
+                        SyncClientCommand::Release(tree, key) => {
+                            let r = release(tree, key, ws_tx).await;
+                            handle_result!(r);
+                        },
                     }
                 }
             }
@@ -262,18 +283,16 @@ async fn event_loop(
                             info!("ws: Connecting to remote {url}");
                             let ws_stream = match tokio_tungstenite::connect_async(url).await {
                                 Ok((ws_stream, _)) => {
-                                    if let Ok(mut telem) = telem.write() {
-                                        telem.connected = true;
-                                        telem.error_message.clear();
-                                    }
+                                    let mut telem = telem.write().await;
+                                    telem.connected = true;
+                                    telem.error_message.clear();
                                     ws_stream
                                 },
                                 Err(e) => {
                                     warn!("{e:?}");
-                                    if let Ok(mut telem) = telem.write() {
-                                        telem.connected = false;
-                                        telem.error_message = format!("{e:?}");
-                                    }
+                                    let mut telem = telem.write().await;
+                                    telem.connected = false;
+                                    telem.error_message = format!("{e:?}");
                                     continue;
                                 }
                             };
@@ -285,15 +304,12 @@ async fn event_loop(
                         SyncClientCommand::RegisterIndex { tree_name, indexer } => {
                             indexers.entry(tree_name).or_default().push(indexer);
                         }
-                    }
-                }
-                event = event_rx.recv() => {
-                    trace!("ev: {event:?}");
-                    if let Some(_event) = event {
-                        // to_replay.push(event);
-                        if let Ok(mut telem) = telem.write() {
-                            telem.backlog += 1;
+                        SyncClientCommand::Change(_event) => {
+                            // to_replay.push(event);
+                            telem.write().await.backlog += 1;
                         }
+                        SyncClientCommand::CheckOut(_, _) => {},
+                        SyncClientCommand::Release(_, _) => {},
                     }
                 }
             }
@@ -306,9 +322,7 @@ async fn event_loop(
                 }
             }
 
-            if let Ok(mut telem) = telem.write() {
-                telem.connected = false;
-            }
+            telem.write().await.connected = false;
         }
     }
 }
@@ -397,5 +411,41 @@ pub async fn request_keys(
         }
     }
     ws_tx.flush().await.map_err(|_| Error::Ws)?;
+    Ok(())
+}
+
+async fn check_out(
+    tree: String,
+    key: GenericKey,
+    tx: &mut (impl Sink<Message> + Unpin),
+) -> Result<(), Error> {
+    let event = Event::CheckOut {
+        tree,
+        keys: vec![key],
+    };
+    let id_event = to_bytes::<_, 8>(&event)?;
+    tx.feed(Message::Binary(id_event.to_vec()))
+        .await
+        .map_err(|_| Error::Ws)?;
+
+    tx.flush().await.map_err(|_| Error::Ws)?;
+    Ok(())
+}
+
+async fn release(
+    tree: String,
+    key: GenericKey,
+    tx: &mut (impl Sink<Message> + Unpin),
+) -> Result<(), Error> {
+    let event = Event::Return {
+        tree,
+        keys: vec![key],
+    };
+    let id_event = to_bytes::<_, 8>(&event)?;
+    tx.feed(Message::Binary(id_event.to_vec()))
+        .await
+        .map_err(|_| Error::Ws)?;
+
+    tx.flush().await.map_err(|_| Error::Ws)?;
     Ok(())
 }
