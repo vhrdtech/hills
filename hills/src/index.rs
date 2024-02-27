@@ -6,6 +6,7 @@ use sled::Tree;
 use crate::{consts::KEY_POOL, db::Error, record::Record};
 
 mod latest_revisions;
+pub mod multi_named;
 pub mod named;
 
 pub enum Action {

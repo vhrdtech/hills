@@ -9,12 +9,12 @@ use crate::db::Error;
 
 use super::{Action, TreeIndex, TypeErasedTree};
 
-type ExtractStrFn = fn(data: &[u8]) -> Result<String, IndexError>;
+type ExtractStrFn = fn(data: &[u8]) -> Result<Vec<String>, IndexError>;
 
-/// Index that maps unique name to a record's key.
+/// Index that maps multiple unique name to the same record key.
 /// Optionally some characters or case could be ignored and whitespace trimmed.
 #[derive(Clone)]
-pub struct NamedIndex {
+pub struct MultiNamedIndex {
     storage: Arc<RwLock<Storage>>,
     exctractor: ExtractStrFn,
     case_sensitive: bool,
@@ -28,7 +28,7 @@ struct Storage {
 }
 
 #[derive(Clone)]
-struct NamedIndexer {
+struct MultiNamedIndexer {
     storage: Arc<RwLock<Storage>>,
     extractor: ExtractStrFn,
     case_sensitive: bool,
@@ -36,7 +36,7 @@ struct NamedIndexer {
     trim_whitespace: bool,
 }
 
-impl NamedIndexer {
+impl MultiNamedIndexer {
     fn post_process(&self, s: String) -> String {
         let s = if self.case_sensitive {
             s
@@ -55,21 +55,23 @@ impl NamedIndexer {
     }
 }
 
-impl TreeIndex for NamedIndexer {
+impl TreeIndex for MultiNamedIndexer {
     fn rebuild(&mut self, tree: TypeErasedTree) -> Result<(), Error> {
         let Ok(mut wr) = self.storage.write() else {
             return Err(Error::Index(IndexError::RwLock));
         };
         wr.index.clear();
         for key in tree.all_revisions() {
-            let s = tree.get_with(key, |data| (self.extractor)(data))??;
-            let s = self.post_process(s);
-            if wr.index.contains_key(&s) {
-                return Err(Error::Index(IndexError::Duplicate(s)));
+            let names = tree.get_with(key, |data| (self.extractor)(data))??;
+            for name in names {
+                let name = self.post_process(name);
+                if wr.index.contains_key(&name) {
+                    return Err(Error::Index(IndexError::Duplicate(name)));
+                }
+                wr.index.insert(name, key);
             }
-            wr.index.insert(s, key);
         }
-        log::debug!("Named index rebuilt: {:?}", wr.index);
+        log::debug!("MultiNamed index rebuilt: {:?}", wr.index);
         Ok(())
     }
 
@@ -85,48 +87,57 @@ impl TreeIndex for NamedIndexer {
         };
         match action {
             Action::Insert => {
-                let s = (self.extractor)(data)?;
-                let s = self.post_process(s);
-                if wr.index.contains_key(&s) {
-                    return Err(Error::Index(IndexError::Duplicate(s)));
+                let names = (self.extractor)(data)?;
+                for name in names {
+                    let name = self.post_process(name);
+                    if wr.index.contains_key(&name) {
+                        return Err(Error::Index(IndexError::Duplicate(name)));
+                    }
+                    wr.index.insert(name, key);
                 }
-                wr.index.insert(s, key);
             }
             Action::Update => {
-                let Some(old_name) = wr
+                let old_names: Vec<String> = wr
                     .index
                     .iter()
-                    .find(|(_, v)| **v == key)
+                    .filter(|(_, v)| **v == key)
                     .map(|(k, _)| k.to_string())
-                else {
-                    return Err(Error::Index(IndexError::Other(
-                        "old name not found".to_string(),
-                    )));
-                };
-                let new_name = (self.extractor)(data)?;
-                let new_name = self.post_process(new_name);
-                if old_name != new_name {
-                    if wr.index.contains_key(&new_name) {
-                        return Err(Error::Index(IndexError::Duplicate(new_name)));
+                    .collect();
+                let new_names = (self.extractor)(data)?;
+                let new_names: Vec<String> = new_names
+                    .into_iter()
+                    .map(|s| self.post_process(s))
+                    .collect();
+                for new_name in &new_names {
+                    if let Some(k) = wr.index.get(new_name) {
+                        if *k != key {
+                            return Err(Error::Index(IndexError::Duplicate(new_name.to_string())));
+                        }
                     }
-                    wr.index.remove(&old_name);
+                }
+                for old_name in old_names.iter().filter(|s| !new_names.contains(s)) {
+                    wr.index.remove(old_name);
+                }
+                for new_name in new_names {
                     wr.index.insert(new_name, key);
                 }
             }
             Action::Remove => {
-                let s = (self.extractor)(data)?;
-                let s = self.post_process(s);
-                wr.index.remove(&s);
+                let names = (self.extractor)(data)?;
+                for name in names {
+                    let name = self.post_process(name);
+                    wr.index.remove(&name);
+                }
             }
         }
-        log::debug!("Named {:?}", wr.index);
+        log::debug!("MultiNamed {:?}", wr.index);
         Ok(())
     }
 }
 
-impl NamedIndex {
+impl MultiNamedIndex {
     pub fn new(exctractor: ExtractStrFn) -> Self {
-        NamedIndex {
+        MultiNamedIndex {
             storage: Arc::new(RwLock::new(Storage::default())),
             exctractor,
             case_sensitive: true,
@@ -136,28 +147,28 @@ impl NamedIndex {
     }
 
     pub fn case_sensitive(self, is_case_sensitive: bool) -> Self {
-        NamedIndex {
+        MultiNamedIndex {
             case_sensitive: is_case_sensitive,
             ..self
         }
     }
 
     pub fn ignore_chars(self, ignore_chars: impl IntoIterator<Item = char>) -> Self {
-        NamedIndex {
+        MultiNamedIndex {
             ignore_chars: ignore_chars.into_iter().collect(),
             ..self
         }
     }
 
     pub fn trim_whitespace(self, is_trim_whitespace: bool) -> Self {
-        NamedIndex {
+        MultiNamedIndex {
             trim_whitespace: is_trim_whitespace,
             ..self
         }
     }
 
     pub fn indexer(&self) -> Box<dyn TreeIndex + Send> {
-        Box::new(NamedIndexer {
+        Box::new(MultiNamedIndexer {
             storage: self.storage.clone(),
             extractor: self.exctractor.clone(),
             case_sensitive: self.case_sensitive,
