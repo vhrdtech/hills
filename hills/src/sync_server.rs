@@ -1,5 +1,5 @@
 use crate::common::{Error, ManagedTrees};
-use crate::consts::{KEYS_PER_REQUEST, SELF_UUID};
+use crate::consts::{CLIENTS_TREE, KEYS_PER_REQUEST, REMOVED_RECORDS_TREE, SELF_UUID};
 use crate::sync::{
     ArchivedEvent, ArchivedHotSyncEventKind, Event, HotSyncEvent, HotSyncEventKind, RecordBorrows,
 };
@@ -11,7 +11,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use hills_base::GenericKey;
 use log::{error, info, trace, warn};
 use rkyv::{check_archived_root, to_bytes, Archive, Deserialize, Serialize};
-use sled::Db;
+use sled::{Db, Tree};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -71,7 +71,7 @@ struct State {
 impl State {
     fn client_name(&self) -> String {
         match &self.info {
-            Some(info) => format!("{}", info.readable_name),
+            Some(info) => format!("{}({})", info.readable_name, Uuid::from_bytes(info.uuid)),
             None => format!("{}", self.remote_addr),
         }
     }
@@ -114,7 +114,6 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
     info!("Server event loop started");
     let (broadcast_tx, broadcast_rx) = postage::broadcast::channel(256);
     drop(broadcast_rx);
-    let removed = Arc::new(RwLock::new(HashMap::new()));
     let borrows = Arc::new(RwLock::new(RecordBorrows::default()));
     loop {
         match listener.accept().await {
@@ -137,13 +136,9 @@ async fn ws_server_acceptor(listener: TcpListener, db: Db) {
                 };
                 let rx = broadcast_tx.subscribe();
                 let tx = broadcast_tx.clone();
-                let removed = removed.clone();
                 let borrows = borrows.clone();
                 tokio::spawn(async move {
-                    ws_event_loop(
-                        ws_sink, ws_source, db_clone, state, rx, tx, removed, borrows,
-                    )
-                    .await
+                    ws_event_loop(ws_sink, ws_source, db_clone, state, rx, tx, borrows).await
                 });
             }
             Err(e) => {
@@ -160,7 +155,6 @@ async fn ws_event_loop(
     mut state: State,
     mut broadcast_rx: postage::broadcast::Receiver<BroadcastEvent>,
     mut broadcast_tx: postage::broadcast::Sender<BroadcastEvent>,
-    removed: Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
     borrows: Arc<RwLock<RecordBorrows>>,
 ) {
     info!("Event loop for {}: started", state.remote_addr);
@@ -169,6 +163,7 @@ async fn ws_event_loop(
 
     use postage::prelude::Stream;
 
+    let removed = db.open_tree(REMOVED_RECORDS_TREE).unwrap();
     loop {
         tokio::select! {
             message = ws_rx.try_next() => {
@@ -245,7 +240,7 @@ async fn process_message(
     db: &mut Db,
     state: &mut State,
     broadcast_tx: &mut postage::broadcast::Sender<BroadcastEvent>,
-    removed: &Arc<RwLock<HashMap<String, Vec<GenericKey>>>>,
+    removed: &Tree,
     borrows: &Arc<RwLock<RecordBorrows>>,
 ) -> Result<(), Error> {
     use postage::prelude::Sink;
@@ -260,8 +255,8 @@ async fn process_message(
             uuid,
             readable_name,
         } => {
-            trace!("Client presenting uuid: {uuid:x?}");
-            let clients = db.open_tree("clients")?;
+            trace!("Client presenting uuid: {}", Uuid::from_bytes(*uuid));
+            let clients = db.open_tree(CLIENTS_TREE)?;
             let client_info = if let Some(client_info_bytes) = clients.get(uuid)? {
                 let client_info = check_archived_root::<ClientInfo>(&client_info_bytes)?;
                 let client_info: ClientInfo =
@@ -269,7 +264,11 @@ async fn process_message(
                 trace!("Known client {client_info:?}");
                 client_info
             } else {
-                trace!("New client {} {uuid:x?}", state.remote_addr);
+                trace!(
+                    "New client {} {}",
+                    state.remote_addr,
+                    Uuid::from_bytes(*uuid)
+                );
                 let mut client_info = ClientInfo {
                     uuid: *uuid,
                     readable_name: readable_name.to_string(),
@@ -303,14 +302,8 @@ async fn process_message(
                 info.subscribed_to.insert(tree.to_string());
             }
 
-            let removed = removed
-                .read()
-                .await
-                .get(tree.as_str())
-                .cloned()
-                .unwrap_or_default();
             let found_in_removed =
-                compare_and_request_missing_records(db, tree, records, &mut ws_tx, &removed)
+                compare_and_request_missing_records(db, tree, records, &mut ws_tx, Some(&removed))
                     .await?;
             if !found_in_removed.is_empty() {
                 trace!("To be removed on client: {found_in_removed:?}");
@@ -368,7 +361,7 @@ async fn process_message(
                 .or_insert(vec![new_range]);
 
             let client_info_bytes = to_bytes::<_, 128>(client_info)?;
-            let clients = db.open_tree("clients")?;
+            let clients = db.open_tree(CLIENTS_TREE)?;
             clients.insert(client_info.uuid, client_info_bytes.as_slice())?;
 
             trace!(
@@ -450,33 +443,34 @@ async fn process_message(
             };
             let tree_name = hot_sync_event.tree_name.as_str();
             let key = GenericKey::from_archived(&hot_sync_event.key);
-            let remote_name = format!("{}", state.client_name());
+            let remote_name = state.client_name();
             trace!(
                 "Got sync from {remote_name}/{tree_name}/{key}: {}",
                 hot_sync_event.kind
             );
+
+            let tree_name_len = tree_name.as_bytes().len();
+            let mut removed_records_key = Vec::with_capacity(tree_name_len + 8);
+            removed_records_key.extend_from_slice(tree_name.as_bytes());
+            removed_records_key.extend_from_slice(&key.to_bytes());
             match hot_sync_event.kind {
-                ArchivedHotSyncEventKind::CreatedOrChanged { meta_iteration, .. } => {
+                ArchivedHotSyncEventKind::CreatedOrChanged { meta_iteration, .. }
+                | ArchivedHotSyncEventKind::MetaChanged { meta_iteration, .. } => {
                     if meta_iteration == 0 && !client_info.owns_key(tree_name, key) {
-                        warn!(
-                            "{} tried to create a record with id {} it doesn't own",
-                            remote_name, key
-                        );
+                        warn!("{remote_name} tried to create {tree_name}{key} with a key it doesn't own, ignoring");
+                        return Ok(());
+                    }
+                    if removed.contains_key(&removed_records_key).unwrap_or(false) {
+                        warn!("{remote_name} tried to create or change previously deleted record: {tree_name}/{key}, ignoring");
                         return Ok(());
                     }
                 }
                 ArchivedHotSyncEventKind::Removed => {
-                    removed
-                        .write()
-                        .await
-                        .entry(tree_name.to_string())
-                        .or_default()
-                        .push(key);
+                    removed.insert(&removed_records_key, &[])?;
                     if let Some(borrowed_keys) = borrows.write().await.borrows.get_mut(tree_name) {
                         borrowed_keys.remove(&key);
                     }
                 }
-                _ => {}
             }
             sync_common::handle_incoming_record(db, hot_sync_event, &remote_name, None)?;
             let mut hot_sync_event_owned: HotSyncEvent =

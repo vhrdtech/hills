@@ -29,17 +29,17 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-pub struct VhrdDbSyncHandle {
+pub(crate) struct SyncHandle {
     db: Db,
 }
 
 #[derive(Clone, Debug)]
 pub enum ChangeNotification {
     Tree { key: OpaqueKey, kind: ChangeKind },
-    Borrowed,
+    BorrowsChanged,
 }
 
-impl VhrdDbSyncHandle {
+impl SyncHandle {
     pub(crate) fn new(db: Db) -> Self {
         Self { db }
     }
@@ -108,8 +108,9 @@ async fn event_loop(
             } else {
                 let mut uuid = [0u8; 16];
                 uuid[..].copy_from_slice(&uuid_bytes);
-                trace!("Server uuid must be {uuid:?}");
-                Some(Uuid::from_bytes(uuid))
+                let uuid = Uuid::from_bytes(uuid);
+                trace!("Server uuid must be {uuid}");
+                Some(uuid)
             }
         }
         _ => None,
@@ -130,8 +131,8 @@ async fn event_loop(
                         };
                         match ev {
                             ArchivedEvent::PresentSelf { uuid, .. } => {
-                                trace!("Server uuid is: {uuid:x?}");
                                 let uuid = Uuid::from_bytes(*uuid);
+                                trace!("Server uuid is: {uuid}");
                                 match server_uuid {
                                     Some(server_uuid) => {
                                         if server_uuid == uuid {
@@ -165,7 +166,7 @@ async fn event_loop(
                             ArchivedEvent::GetTreeOverview { .. } => {}
                             ArchivedEvent::TreeOverview { tree, records } => {
                                 trace!("Got {tree} overview {records:?}");
-                                if let Err(e) = compare_and_request_missing_records(&db, tree, records, ws_tx, &[]).await {
+                                if let Err(e) = compare_and_request_missing_records(&db, tree, records, ws_tx, None).await {
                                     error!("tree overview: {e:?}");
                                 }
                             }
@@ -187,6 +188,9 @@ async fn event_loop(
                                 let key = GenericKey::from_archived(key);
                                 trace!("Now checked out for {}/{}: {:?}", tree.as_str(), key, queue);
                                 borrowed_keys.insert(key, queue);
+                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, ChangeNotification::BorrowsChanged).await {
+                                    warn!("Notification send: mpsc fail");
+                                }
                             }
                             ArchivedEvent::HotSyncEvent(hot_sync_event) => {
                                 let tree_name = hot_sync_event.tree_name.as_str();
@@ -218,8 +222,8 @@ async fn event_loop(
                             }
                         }
                     } else {
-                        warn!("Unsupported ws message or None from channel, disconnecting");
-                        should_disconnect = true;
+                        warn!("Unsupported ws message or None from channel, ignoring");
+                        // should_disconnect = true;
                     }
                 }
                 cmd = cmd_rx.recv() => {

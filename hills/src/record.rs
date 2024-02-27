@@ -1,15 +1,7 @@
 use hills_base::{GenericKey, SimpleVersion, UtcDateTime};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
-// #[derive(Archive, Serialize, Deserialize)]
-// pub struct NodeId(u64);
-
-// Whether some node is holding an entry mutable or not.
-// If node id is not self, then no modifications should be done to an entry.
-// Server must reject modified entries from a node if they weren't first checked out by the same node.
-// held_mut_by: Option<NodeId>,
-
-/// Tree record holding meta information, dates and data itself.
+/// Tree record holding meta information, record iteration and data itself.
 #[derive(Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 // #[archive_attr(derive(Debug))]
@@ -24,7 +16,7 @@ pub struct Record {
     pub data_iteration: u32,
     /// Data type version used to serialize the data.
     pub data_evolution: SimpleVersion,
-    /// None when only id was created, but no data has been written yet.
+    /// Versioned(T) user data in rkyv format.
     pub data: AlignedVec,
 }
 
@@ -48,12 +40,10 @@ pub struct RecordMeta {
     pub created: UtcDateTime,
     // Additional metadata accessible by user.
     // pub meta: Option<AlignedVec>,
-    /// Rust version of the program, that serialized the data.
-    pub rust_version: SimpleVersion,
+    // Rust version of the program, that serialized the data.
+    // pub rust_version: SimpleVersion,
     /// rkyv version that was used to serialize the data.
     pub rkyv_version: SimpleVersion,
-    // User program version used to serialize the data.
-    // pub evolution: SimpleVersion,
 }
 
 /// Record state
@@ -64,8 +54,9 @@ pub enum Version {
     /// Record can be edited many times, only latest data is kept and synchronised between nodes
     NonVersioned,
     /// Version controlled Record, not yet released and can be modified multiple times. Next revision cannot be created.
-    Draft,
+    ///  Number can be used for other Draft user states.
+    Draft(u32),
     /// Record is released and it's data cannot be changed.
-    /// u32 can be used for other user states (Approved, Obsolete, etc), that can be changed.
+    /// Number can be used for other Released user states (Approved, Obsolete, ..).
     Released(u32),
 }

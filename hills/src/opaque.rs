@@ -1,5 +1,5 @@
 use crate::consts::KEY_POOL;
-use crate::db::Error;
+use crate::db::{Error, RecordCheckOutState};
 use crate::record::RecordMeta;
 use crate::TypedTree;
 use hills_base::{GenericKey, SimpleVersion, TreeKey, TreeRoot};
@@ -43,6 +43,7 @@ pub trait OpaqueTree {
     fn remove(&mut self, key: &OpaqueKey) -> Result<(), Error>;
 
     fn is_checked_out(&self, key: &OpaqueKey) -> Result<bool, Error>;
+    fn checked_out_by(&self, key: &OpaqueKey) -> Result<RecordCheckOutState, Error>;
     fn check_out(&mut self, key: &OpaqueKey) -> Result<(), Error>;
     fn release(&mut self, key: &OpaqueKey) -> Result<(), Error>;
 
@@ -140,6 +141,11 @@ where
         let key = check_key(key, self.tree_name.as_str())?;
         <TypedTree<K, V>>::release(self, key);
         Ok(())
+    }
+
+    fn checked_out_by(&self, key: &OpaqueKey) -> Result<RecordCheckOutState, Error> {
+        let key = check_key(key, self.tree_name.as_str())?;
+        Ok(<TypedTree<K, V>>::checked_out_by(&self, key))
     }
 }
 

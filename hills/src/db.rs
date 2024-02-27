@@ -1,5 +1,5 @@
 use crate::common::ManagedTrees;
-use crate::consts::{KEY_POOL, READABLE_NAME, SELF_UUID};
+use crate::consts::{DESCRIPTORS_TREE, KEY_POOL, READABLE_NAME, SELF_UUID};
 use crate::index::{TreeIndex, TypeErasedTree};
 use crate::key_pool::{ArchivedKeyPool, KeyPool};
 use crate::opaque::OpaqueKey;
@@ -7,7 +7,7 @@ use crate::record::{ArchivedVersion, RecordMeta};
 use crate::record::{Record, Version};
 use crate::sync::{ChangeKind, RecordBorrows, RecordHotChange};
 use crate::sync_client::{
-    ChangeNotification, SyncClientCommand, SyncClientTelemetry, VhrdDbCmdTx, VhrdDbSyncHandle,
+    ChangeNotification, SyncClientCommand, SyncClientTelemetry, SyncHandle, VhrdDbCmdTx,
 };
 use crate::tree::{ArchivedTreeDescriptor, TreeDescriptor};
 use crate::VhrdDbTelem;
@@ -172,6 +172,18 @@ impl From<CommonError> for Error {
     }
 }
 
+/// Holds information about record's borrow state.
+pub enum RecordCheckOutState {
+    /// Record is currently not checked out by any client
+    Empty,
+    /// Record is checked out by .0 and maybe others, this client is waiting as well
+    WaitingFor(Uuid),
+    /// Record is checked out by .0 and maybe others, this client is not waiting
+    CheckedOutBy(Uuid),
+    /// Record is borrowed by this client and could be modified
+    CheckedOut,
+}
+
 impl HillsClient {
     pub fn open<P: AsRef<Path>>(
         path: P,
@@ -188,7 +200,7 @@ impl HillsClient {
         let db = sled::open(path)?;
         #[cfg(test)]
         let db = sled::Config::new().temporary(true).path(path).open()?;
-        let descriptors = db.open_tree("descriptors")?;
+        let descriptors = db.open_tree(DESCRIPTORS_TREE)?;
 
         let self_uuid = match db.get(SELF_UUID)? {
             Some(uuid_bytes) => {
@@ -197,8 +209,9 @@ impl HillsClient {
                 }
                 let mut uuid = [0u8; 16];
                 uuid[..].copy_from_slice(&uuid_bytes);
-                trace!("Self uuid is {uuid:?}");
-                Uuid::from_bytes(uuid)
+                let uuid = Uuid::from_bytes(uuid);
+                trace!("Self uuid is {uuid}");
+                uuid
             }
             None => {
                 let uuid = Uuid::new_v4();
@@ -209,7 +222,7 @@ impl HillsClient {
             }
         };
 
-        let sync_handle = VhrdDbSyncHandle::new(db.clone());
+        let sync_handle = SyncHandle::new(db.clone());
         let (updates_tx, updates_rx) = postage::broadcast::channel(64);
         let borrows = Arc::new(RwLock::new(RecordBorrows::default()));
         let (cmd_tx, telem, syncer_join) =
@@ -249,6 +262,9 @@ impl HillsClient {
         V: TreeRoot + Reflect,
     {
         let tree_name = <V as TreeRoot>::tree_name();
+        if tree_name.starts_with("_") {
+            return Err(Error::Usage("Tree names cannot start with '_'".to_string()));
+        }
         let versioning = <V as TreeRoot>::versioning();
 
         ManagedTrees::add_to_managed(&self.db, tree_name)?;
@@ -331,6 +347,9 @@ impl HillsClient {
                 key_tree_name.to_string(),
                 tree_name.to_string(),
             ));
+        }
+        if tree_name.starts_with("_") {
+            return Err(Error::Usage("Tree names cannot start with '_'".to_string()));
         }
         ManagedTrees::add_to_managed(&self.db, tree_name)?;
 
@@ -514,7 +533,7 @@ where
         }
 
         let versioning = if self.versioning {
-            Version::Draft
+            Version::Draft(0)
         } else {
             Version::NonVersioned
         };
@@ -525,7 +544,6 @@ where
             modified_by: self.username.clone(),
             modified: Utc::now().into(),
             created: Utc::now().into(),
-            rust_version: SimpleVersion::rust_version(),
             rkyv_version: SimpleVersion::rkyv_version(),
         };
         let record = Record {
@@ -591,7 +609,7 @@ where
                 )));
             };
             let previous_record = check_archived_root::<Record>(&previous_record)?;
-            if matches!(previous_record.meta.version, ArchivedVersion::Draft) {
+            if matches!(previous_record.meta.version, ArchivedVersion::Draft(0)) {
                 return Err(Error::VersioningMismatch(format!("Cannot release a new revision if previous one is not in Released state {}/{generic_key}", self.tree_name)));
             }
             // self.latest_revision_index.remove(previous)?;
@@ -619,7 +637,7 @@ where
             }
 
             let versioning = if self.versioning {
-                Version::Draft
+                Version::Draft(0)
             } else {
                 Version::NonVersioned
             };
@@ -634,7 +652,6 @@ where
                     .created
                     .deserialize(&mut rkyv::Infallible)
                     .expect(""),
-                rust_version: SimpleVersion::rust_version(),
                 rkyv_version: SimpleVersion::rkyv_version(),
             };
             let record = Record {
@@ -813,9 +830,7 @@ where
     }
 
     pub fn is_checked_out(&self, key: K) -> bool {
-        let Ok(rd) = self.borrows.try_read() else {
-            return false;
-        };
+        let rd = self.borrows.blocking_read();
         if let Some(borrowed_keys) = rd.borrows.get(self.tree_name.as_str()) {
             let key = key.to_generic();
             match borrowed_keys.get(&key) {
@@ -824,6 +839,30 @@ where
             }
         } else {
             false
+        }
+    }
+
+    pub fn checked_out_by(&self, key: K) -> RecordCheckOutState {
+        let rd = self.borrows.blocking_read();
+        if let Some(borrowed_keys) = rd.borrows.get(self.tree_name.as_str()) {
+            let key = key.to_generic();
+            match borrowed_keys.get(&key) {
+                Some(queue) => {
+                    let Some(checked_out_by) = queue.get(0) else {
+                        return RecordCheckOutState::Empty;
+                    };
+                    if checked_out_by == &self.uuid {
+                        RecordCheckOutState::CheckedOut
+                    } else if queue.contains(&self.uuid) {
+                        RecordCheckOutState::WaitingFor(*checked_out_by)
+                    } else {
+                        RecordCheckOutState::CheckedOutBy(*checked_out_by)
+                    }
+                }
+                None => RecordCheckOutState::Empty,
+            }
+        } else {
+            RecordCheckOutState::Empty
         }
     }
 

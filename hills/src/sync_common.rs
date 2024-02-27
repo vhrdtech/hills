@@ -13,12 +13,15 @@ use log::{error, trace, warn};
 use rkyv::collections::ArchivedHashMap;
 use rkyv::vec::ArchivedVec;
 use rkyv::{check_archived_root, to_bytes, AlignedVec, Deserialize};
-use sled::Db;
+use sled::{Db, Tree};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::Message;
 
-pub async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) -> Result<(), Error> {
+pub(crate) async fn present_self(
+    db: &Db,
+    tx: &mut (impl Sink<Message> + Unpin),
+) -> Result<(), Error> {
     let Some(uuid_bytes) = db.get(SELF_UUID)? else {
         return Err(Error::Internal("self uuid is absent".into()));
     };
@@ -45,7 +48,7 @@ pub async fn present_self(db: &Db, tx: &mut (impl Sink<Message> + Unpin)) -> Res
     Ok(())
 }
 
-pub async fn send_hot_change(
+pub(crate) async fn send_hot_change(
     db: &Db,
     change: RecordHotChange,
     ws_tx: &mut (impl Sink<Message> + Unpin),
@@ -114,7 +117,8 @@ pub async fn send_hot_change(
     Ok(())
 }
 
-pub async fn send_tree_overviews(
+/// For each tree in use: send a list of keys it contains, so the other end could request what's missing.
+pub(crate) async fn send_tree_overviews(
     db: &Db,
     ws_tx: &mut (impl Sink<Message> + Unpin),
 ) -> Result<(), Error> {
@@ -154,19 +158,35 @@ pub async fn send_tree_overviews(
     Ok(())
 }
 
-pub async fn compare_and_request_missing_records(
+/// Iterate through the list of records and request missing ones.
+///
+/// Called both on server and clients.
+/// Server additionally checks if client holds a record that were previously removed, sending a remove change to it if found.
+pub(crate) async fn compare_and_request_missing_records(
     db: &Db,
     tree_name: impl AsRef<str>,
     records: &ArchivedHashMap<ArchivedGenericKey, ArchivedRecordIteration>,
     ws_tx: &mut (impl Sink<Message> + Unpin),
-    removed: &[GenericKey],
+    removed_records: Option<&Tree>,
 ) -> Result<Vec<GenericKey>, Error> {
-    let tree = db.open_tree(tree_name.as_ref())?;
+    let tree_name = tree_name.as_ref();
+    let tree = db.open_tree(tree_name)?;
     let mut missing_or_outdated = Vec::new();
     let mut found_in_removed = Vec::new();
+
+    let tree_name_len = tree_name.as_bytes().len();
+    let mut removed_records_key = Vec::with_capacity(tree_name_len + 8);
+    removed_records_key.extend_from_slice(tree_name.as_bytes());
+    removed_records_key.extend_from_slice(&[0; 8]);
+
     for (key, remote_record) in records.iter() {
         let key = GenericKey::from_archived(key);
-        if removed.contains(&key) {
+
+        removed_records_key[tree_name_len..].copy_from_slice(&key.to_bytes());
+        if removed_records
+            .map(|r| r.contains_key(&removed_records_key).unwrap_or(false))
+            .unwrap_or(false)
+        {
             found_in_removed.push(key);
             continue;
         }
@@ -186,12 +206,9 @@ pub async fn compare_and_request_missing_records(
             }
         }
     }
-    trace!(
-        "{} missing or outdated: {missing_or_outdated:?}",
-        tree_name.as_ref()
-    );
+    trace!("{tree_name} missing or outdated: {missing_or_outdated:?}",);
     let ev = Event::RequestRecords {
-        tree: tree_name.as_ref().to_string(),
+        tree: tree_name.to_string(),
         keys: missing_or_outdated,
     };
     let ev_bytes = to_bytes::<_, 128>(&ev)?;
@@ -233,7 +250,7 @@ macro_rules! handle_result {
 }
 pub use handle_result;
 
-pub fn handle_incoming_record(
+pub(crate) fn handle_incoming_record(
     db: &mut Db,
     ev: &ArchivedHotSyncEvent,
     remote_name: &str,
@@ -420,7 +437,7 @@ pub fn handle_incoming_record(
     Ok(())
 }
 
-pub async fn send_records(
+pub(crate) async fn send_records(
     db: &Db,
     tree_name: impl AsRef<str>,
     keys: &ArchivedVec<ArchivedGenericKey>,
