@@ -1,25 +1,25 @@
+use std::marker::PhantomData;
 use std::{
     collections::BTreeMap,
     sync::{Arc, RwLock},
 };
 
-use hills_base::{index::IndexError, GenericKey};
+use hills_base::{index::IndexError, GenericKey, TreeKey};
 
 use crate::db::Error;
 
-use super::{Action, TreeIndex, TypeErasedTree};
+use super::{Action, StringPostProcess, TreeIndex, TypeErasedTree};
 
 type ExtractStrFn = fn(data: &[u8]) -> Result<String, IndexError>;
 
 /// Index that maps unique name to a record's key.
 /// Optionally some characters or case could be ignored and whitespace trimmed.
 #[derive(Clone)]
-pub struct NamedIndex {
+pub struct NamedIndex<K: TreeKey> {
     storage: Arc<RwLock<Storage>>,
     exctractor: ExtractStrFn,
-    case_sensitive: bool,
-    ignore_chars: Vec<char>,
-    trim_whitespace: bool,
+    post_process: StringPostProcess,
+    _phantom: PhantomData<K>,
 }
 
 #[derive(Default)]
@@ -31,28 +31,7 @@ struct Storage {
 struct NamedIndexer {
     storage: Arc<RwLock<Storage>>,
     extractor: ExtractStrFn,
-    case_sensitive: bool,
-    ignore_chars: Vec<char>,
-    trim_whitespace: bool,
-}
-
-impl NamedIndexer {
-    fn post_process(&self, s: String) -> String {
-        let s = if self.case_sensitive {
-            s
-        } else {
-            s.to_lowercase()
-        };
-        let s = if self.trim_whitespace {
-            s.trim()
-        } else {
-            s.as_str()
-        };
-        s.chars()
-            .into_iter()
-            .filter(|c| !self.ignore_chars.contains(&c))
-            .collect()
-    }
+    post_process: StringPostProcess,
 }
 
 impl TreeIndex for NamedIndexer {
@@ -63,7 +42,7 @@ impl TreeIndex for NamedIndexer {
         wr.index.clear();
         for key in tree.all_revisions() {
             let s = tree.get_with(key, |data| (self.extractor)(data))??;
-            let s = self.post_process(s);
+            let s = self.post_process.post_process(s);
             if wr.index.contains_key(&s) {
                 return Err(Error::Index(IndexError::Duplicate(s)));
             }
@@ -86,7 +65,7 @@ impl TreeIndex for NamedIndexer {
         match action {
             Action::Insert => {
                 let s = (self.extractor)(data)?;
-                let s = self.post_process(s);
+                let s = self.post_process.post_process(s);
                 if wr.index.contains_key(&s) {
                     return Err(Error::Index(IndexError::Duplicate(s)));
                 }
@@ -104,7 +83,7 @@ impl TreeIndex for NamedIndexer {
                     )));
                 };
                 let new_name = (self.extractor)(data)?;
-                let new_name = self.post_process(new_name);
+                let new_name = self.post_process.post_process(new_name);
                 if old_name != new_name {
                     if wr.index.contains_key(&new_name) {
                         return Err(Error::Index(IndexError::Duplicate(new_name)));
@@ -115,7 +94,7 @@ impl TreeIndex for NamedIndexer {
             }
             Action::Remove => {
                 let s = (self.extractor)(data)?;
-                let s = self.post_process(s);
+                let s = self.post_process.post_process(s);
                 wr.index.remove(&s);
             }
         }
@@ -124,52 +103,52 @@ impl TreeIndex for NamedIndexer {
     }
 }
 
-impl NamedIndex {
+impl<K: TreeKey> NamedIndex<K> {
     pub fn new(exctractor: ExtractStrFn) -> Self {
         NamedIndex {
             storage: Arc::new(RwLock::new(Storage::default())),
             exctractor,
-            case_sensitive: true,
-            ignore_chars: vec![],
-            trim_whitespace: false,
+            post_process: StringPostProcess {
+                case_sensitive: true,
+                ignore_chars: vec![],
+                trim_whitespace: false,
+            },
+            _phantom: PhantomData {},
         }
     }
 
-    pub fn case_sensitive(self, is_case_sensitive: bool) -> Self {
-        NamedIndex {
-            case_sensitive: is_case_sensitive,
-            ..self
-        }
+    pub fn case_sensitive(mut self, is_case_sensitive: bool) -> Self {
+        self.post_process.case_sensitive = is_case_sensitive;
+        self
     }
 
-    pub fn ignore_chars(self, ignore_chars: impl IntoIterator<Item = char>) -> Self {
-        NamedIndex {
-            ignore_chars: ignore_chars.into_iter().collect(),
-            ..self
-        }
+    pub fn ignore_chars(mut self, ignore_chars: impl IntoIterator<Item = char>) -> Self {
+        self.post_process.ignore_chars = ignore_chars.into_iter().collect();
+        self
     }
 
-    pub fn trim_whitespace(self, is_trim_whitespace: bool) -> Self {
-        NamedIndex {
-            trim_whitespace: is_trim_whitespace,
-            ..self
-        }
+    pub fn trim_whitespace(mut self, is_trim_whitespace: bool) -> Self {
+        self.post_process.trim_whitespace = is_trim_whitespace;
+        self
     }
 
     pub fn indexer(&self) -> Box<dyn TreeIndex + Send> {
         Box::new(NamedIndexer {
             storage: self.storage.clone(),
             extractor: self.exctractor.clone(),
-            case_sensitive: self.case_sensitive,
-            ignore_chars: self.ignore_chars.clone(),
-            trim_whitespace: self.trim_whitespace,
+            post_process: self.post_process.clone(),
         })
     }
 
-    pub fn get(&self, s: impl AsRef<str>) -> Option<GenericKey> {
+    pub fn get(&self, s: impl AsRef<str>) -> Option<K> {
         let Ok(rd) = self.storage.read() else {
             return None;
         };
-        rd.index.get(s.as_ref()).cloned()
+
+        let s = self.post_process.post_process(s);
+        rd.index
+            .get(s.as_str())
+            .cloned()
+            .map(|k| K::from_generic(k))
     }
 }

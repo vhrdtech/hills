@@ -4,7 +4,7 @@
 
 # Features and requirements
 
-* Strongly typed, support any Rust type that [rkyv](https://github.com/rkyv/rkyv)[^1] supports.
+* Strongly typed, support any Rust type that [rkyv](https://github.com/rkyv/rkyv) supports.
 * Data is organised as a collection of named kv trees.
 * Each record is uniquely identified by a typed key: (id, revision).
   * Key's from one tree cannot be used with another, to improve code readability and help avoid errors.
@@ -35,6 +35,7 @@
 * Data backup (database folder could be backed up though when server is stopped).
 * Not very well tested and wasn't yet used for a long time.
 * Authentication is not implemented, should only be used on a private network or through VPN.
+* Apart from indexing support there is not much in terms of queries and other relational database features.
 * Record borrows are not saved when server is stopped or a client application is closed.
   * If client is restarted and connects back - borrows are shared with the client.
   * If server is restarted while a client still holds records, it can continue editing without server knowing.
@@ -68,6 +69,3 @@ Additionally gaining several properties, such as:
 In particular, it is used for an internal product lifetime and manufacturing management system at vhrd.tech.
 Keeping track of products, equipment, bill of materials, parts stock and ordering, serials and barcodes in use and others.
 System is accessed from user workstations to view and edit data, as well as from various machinery (e.g. pick and place machine, when assembling boards and fetching parts from a warehouse stock).
-
----
-[^1]: Pretty much everything that serde support, except self-referential structs. Also hills itself requires that each tree's root type must be a struct.

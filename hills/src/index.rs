@@ -76,3 +76,29 @@ impl<'a> TypeErasedTree<'a> {
         }
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct StringPostProcess {
+    pub(crate) case_sensitive: bool,
+    pub(crate) ignore_chars: Vec<char>,
+    pub(crate) trim_whitespace: bool,
+}
+
+impl StringPostProcess {
+    fn post_process(&self, s: impl AsRef<str>) -> String {
+        let s = if self.case_sensitive {
+            s.as_ref().to_string()
+        } else {
+            s.as_ref().to_lowercase()
+        };
+        let s = if self.trim_whitespace {
+            s.trim()
+        } else {
+            s.as_str()
+        };
+        s.chars()
+            .into_iter()
+            .filter(|c| !self.ignore_chars.contains(&c))
+            .collect()
+    }
+}
