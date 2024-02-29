@@ -17,7 +17,7 @@ type ExtractStrFn = fn(data: &[u8]) -> Result<String, IndexError>;
 #[derive(Clone)]
 pub struct NamedIndex<K: TreeKey> {
     storage: Arc<RwLock<Storage>>,
-    exctractor: ExtractStrFn,
+    extractor: ExtractStrFn,
     post_process: StringPostProcess,
     _phantom: PhantomData<K>,
 }
@@ -107,7 +107,7 @@ impl<K: TreeKey> NamedIndex<K> {
     pub fn new(exctractor: ExtractStrFn) -> Self {
         NamedIndex {
             storage: Arc::new(RwLock::new(Storage::default())),
-            exctractor,
+            extractor: exctractor,
             post_process: StringPostProcess {
                 case_sensitive: true,
                 ignore_chars: vec![],
@@ -135,7 +135,7 @@ impl<K: TreeKey> NamedIndex<K> {
     pub fn indexer(&self) -> Box<dyn TreeIndex + Send> {
         Box::new(NamedIndexer {
             storage: self.storage.clone(),
-            extractor: self.exctractor.clone(),
+            extractor: self.extractor.clone(),
             post_process: self.post_process.clone(),
         })
     }

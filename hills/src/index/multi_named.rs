@@ -17,7 +17,7 @@ type ExtractStrFn = fn(data: &[u8]) -> Result<Vec<String>, IndexError>;
 #[derive(Clone)]
 pub struct MultiNamedIndex<K> {
     storage: Arc<RwLock<Storage>>,
-    exctractor: ExtractStrFn,
+    extractor: ExtractStrFn,
     settings: StringPostProcess,
     _phantom: PhantomData<K>,
 }
@@ -118,7 +118,7 @@ impl<K: TreeKey> MultiNamedIndex<K> {
     pub fn new(exctractor: ExtractStrFn) -> Self {
         MultiNamedIndex {
             storage: Arc::new(RwLock::new(Storage::default())),
-            exctractor,
+            extractor: exctractor,
             settings: StringPostProcess {
                 case_sensitive: true,
                 ignore_chars: vec![],
@@ -146,7 +146,7 @@ impl<K: TreeKey> MultiNamedIndex<K> {
     pub fn indexer(&self) -> Box<dyn TreeIndex + Send> {
         Box::new(MultiNamedIndexer {
             storage: self.storage.clone(),
-            extractor: self.exctractor.clone(),
+            extractor: self.extractor.clone(),
             settings: self.settings.clone(),
         })
     }

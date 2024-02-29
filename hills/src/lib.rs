@@ -15,6 +15,7 @@ pub mod tree;
 pub use db::{HillsClient, TypedTree};
 pub use sync_client::VhrdDbTelem;
 
+pub use hills_base::index::IndexError;
 pub use hills_base::{GenericKey, TreeKey, UtcDateTime};
 pub use uuid;
 
