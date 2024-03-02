@@ -9,6 +9,7 @@ use crate::sync_common::{
     compare_and_request_missing_records, handle_incoming_record, present_self, send_hot_change,
     send_records, send_tree_overviews,
 };
+use core::ops::Range;
 use futures_util::Sink;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -35,8 +36,21 @@ pub(crate) struct SyncHandle {
 
 #[derive(Clone, Debug)]
 pub enum ChangeNotification {
-    Tree { key: OpaqueKey, kind: ChangeKind },
-    BorrowsChanged,
+    Tree {
+        key: OpaqueKey,
+        kind: ChangeKind,
+    },
+    BorrowsChanged {
+        tree_name: String,
+        key: GenericKey,
+        queue: Vec<Uuid>,
+    },
+    Connected,
+    Disconnected,
+    GotKeys {
+        tree_name: String,
+        keys: Range<u32>,
+    },
 }
 
 impl SyncHandle {
@@ -172,23 +186,28 @@ async fn event_loop(
                             }
                             ArchivedEvent::KeySet { tree, keys } => {
                                 trace!("Got more keys for {tree} {keys:?}");
-                                let Ok(tree) = db.open_tree(tree.as_str()) else {
+                                let Ok(db_tree) = db.open_tree(tree.as_str()) else {
                                     error!("key set open_tree failed");
                                     continue
                                 };
                                 let keys = keys.start..keys.end;
-                                if let Err(e) = KeyPool::feed_for(&tree, keys).map_err(Error::Internal) {
+                                if let Err(e) = KeyPool::feed_for(&db_tree, keys.clone()).map_err(Error::Internal) {
                                     error!("key set: {e:?}");
+                                }
+                                let notification = ChangeNotification::GotKeys { tree_name: tree.to_string(), keys };
+                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, notification).await {
+                                    warn!("Notification send: mpsc fail");
                                 }
                             }
                             ArchivedEvent::CheckedOut { tree, key, queue } => {
                                 let borrows = &mut borrows.write().await.borrows;
                                 let borrowed_keys = borrows.entry(tree.as_str().to_string()).or_default();
-                                let queue = queue.iter().map(|uuid| Uuid::from_bytes(*uuid)).collect();
+                                let queue: Vec<Uuid> = queue.iter().map(|uuid| Uuid::from_bytes(*uuid)).collect();
                                 let key = GenericKey::from_archived(key);
                                 trace!("Now checked out for {}/{}: {:?}", tree.as_str(), key, queue);
-                                borrowed_keys.insert(key, queue);
-                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, ChangeNotification::BorrowsChanged).await {
+                                borrowed_keys.insert(key, queue.clone());
+                                let notification = ChangeNotification::BorrowsChanged { tree_name: tree.to_string(), key, queue };
+                                if let Err(_) = postage::sink::Sink::send(&mut updates_tx, notification).await {
                                     warn!("Notification send: mpsc fail");
                                 }
                             }
@@ -275,6 +294,9 @@ async fn event_loop(
                                     let mut telem = telem.write().await;
                                     telem.connected = true;
                                     telem.error_message.clear();
+                                    if let Err(_) = postage::sink::Sink::send(&mut updates_tx, ChangeNotification::Connected).await {
+                                        warn!("Notification send: mpsc fail");
+                                    }
                                     ws_stream
                                 },
                                 Err(e) => {
@@ -316,6 +338,11 @@ async fn event_loop(
             }
 
             telem.write().await.connected = false;
+            if let Err(_) =
+                postage::sink::Sink::send(&mut updates_tx, ChangeNotification::Disconnected).await
+            {
+                warn!("Notification send: mpsc fail");
+            }
         }
     }
 }
