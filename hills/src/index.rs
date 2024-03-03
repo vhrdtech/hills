@@ -34,6 +34,18 @@ pub trait TreeIndex: DynClone {
 
 dyn_clone::clone_trait_object!(TreeIndex);
 
+pub trait TreeSearch {
+    type Key;
+    /// Lookup records with a similar name and return their keys and textual representation.
+    fn search(&self, text: impl AsRef<str>) -> Vec<(Self::Key, String, Similarity)>;
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Similarity {
+    Exact,
+    Loose,
+}
+
 impl<'a> TypeErasedTree<'a> {
     pub fn all_revisions(&self) -> impl Iterator<Item = GenericKey> {
         self.tree.iter().keys().filter_map(|key| {
