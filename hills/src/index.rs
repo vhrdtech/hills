@@ -36,8 +36,12 @@ dyn_clone::clone_trait_object!(TreeIndex);
 
 pub trait TreeSearch {
     type Key;
-    /// Lookup records with a similar name and return their keys and textual representation.
-    fn search(&self, text: impl AsRef<str>) -> Vec<SearchHit<Self::Key>>;
+
+    /// Lookup records with a query and return their keys and textual representation.
+    fn search(&self, query: impl AsRef<str>) -> Vec<SearchHit<Self::Key>>;
+
+    /// Return name and description for an already known key.
+    fn name_desc(&self, key: Self::Key) -> Result<(String, String), Error>;
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -47,7 +51,7 @@ pub struct SearchHit<K> {
     /// Name as is from the tree record
     pub name: String,
     /// Name and optional additional information to show during search process
-    pub repr: String,
+    pub description: String,
     pub similarity: Similarity,
 }
 
