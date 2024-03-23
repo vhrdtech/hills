@@ -41,7 +41,17 @@ impl TreeIndex for MultiNamedIndexer {
         };
         wr.index.clear();
         for key in tree.all_revisions() {
-            let names = tree.get_with(key, |data| (self.extractor)(data))??;
+            let names = match tree.get_with(key, |data| (self.extractor)(data)) {
+                Ok(Ok(names)) => names,
+                Ok(Err(e)) => {
+                    log::error!("{key}: {:?}, skipping", e);
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("{key}: {:?}, skipping", e);
+                    continue;
+                }
+            };
             for name in names {
                 let name = self.settings.post_process(name);
                 if wr.index.contains_key(&name) {
@@ -50,7 +60,7 @@ impl TreeIndex for MultiNamedIndexer {
                 wr.index.insert(name, key);
             }
         }
-        log::debug!("MultiNamed index rebuilt: {:?}", wr.index);
+        // log::debug!("MultiNamed index rebuilt: {:?}", wr.index);
         Ok(())
     }
 
@@ -109,7 +119,7 @@ impl TreeIndex for MultiNamedIndexer {
                 }
             }
         }
-        log::debug!("MultiNamed {:?}", wr.index);
+        // log::debug!("MultiNamed {:?}", wr.index);
         Ok(())
     }
 }

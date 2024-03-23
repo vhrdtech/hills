@@ -223,7 +223,7 @@ impl HillsClient {
         };
 
         let sync_handle = SyncHandle::new(db.clone());
-        let (updates_tx, updates_rx) = postage::broadcast::channel(64);
+        let (updates_tx, updates_rx) = postage::broadcast::channel(1024);
         let borrows = Arc::new(RwLock::new(RecordBorrows::default()));
         let (cmd_tx, telem, syncer_join) =
             sync_handle.start(rt, updates_tx.clone(), borrows.clone());

@@ -5,6 +5,7 @@ use std::{
 };
 
 use hills_base::{index::IndexError, GenericKey, TreeKey};
+use log::error;
 
 use crate::db::Error;
 
@@ -41,14 +42,24 @@ impl TreeIndex for NamedIndexer {
         };
         wr.index.clear();
         for key in tree.all_revisions() {
-            let s = tree.get_with(key, |data| (self.extractor)(data))??;
+            let s = match tree.get_with(key, |data| (self.extractor)(data)) {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    error!("{key}: {:?}, skipping", e);
+                    continue;
+                }
+                Err(e) => {
+                    error!("{key}: {:?}, skipping", e);
+                    continue;
+                }
+            };
             let s = self.post_process.post_process(s);
             if wr.index.contains_key(&s) {
                 return Err(Error::Index(IndexError::Duplicate(s)));
             }
             wr.index.insert(s, key);
         }
-        log::debug!("Named index rebuilt: {:?}", wr.index);
+        // log::debug!("Named index rebuilt: {:?}", wr.index);
         Ok(())
     }
 
@@ -98,7 +109,7 @@ impl TreeIndex for NamedIndexer {
                 wr.index.remove(&s);
             }
         }
-        log::debug!("Named {:?}", wr.index);
+        // log::debug!("Named {:?}", wr.index);
         Ok(())
     }
 }
