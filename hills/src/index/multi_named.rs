@@ -8,7 +8,7 @@ use hills_base::{index::IndexError, GenericKey, TreeKey};
 
 use crate::db::Error;
 
-use super::{Action, StringPostProcess, TreeIndex, TypeErasedTree};
+use super::{Action, Similarity, StringPostProcess, TreeIndex, TypeErasedTree};
 
 type ExtractStrFn = fn(data: &[u8]) -> Result<Vec<String>, IndexError>;
 
@@ -170,5 +170,27 @@ impl<K: TreeKey> MultiNamedIndex<K> {
             .get(s.as_str())
             .cloned()
             .map(|k| K::from_generic(k))
+    }
+
+    pub fn get_similar(&self, s: impl AsRef<str>) -> Vec<(K, Similarity)> {
+        let Ok(rd) = self.storage.read() else {
+            return vec![];
+        };
+
+        let mut similar = vec![];
+
+        let s = self.settings.post_process(s);
+        if let Some(k) = rd.index.get(s.as_str()) {
+            similar.push((K::from_generic(*k), Similarity::Exact));
+        }
+        for (k, v) in &rd.index {
+            if k.starts_with(&s) || k.contains(&s) {
+                similar.push((K::from_generic(*v), Similarity::Loose));
+                if similar.len() >= 20 {
+                    break;
+                }
+            }
+        }
+        similar
     }
 }
