@@ -718,11 +718,11 @@ where
         }
     }
 
-    pub fn get_archived<F: FnMut(Option<&V::Archived>) -> R, R>(
+    pub fn get_archived<F: FnMut(&V::Archived) -> R, R>(
         &self,
         key: K,
         mut f: F,
-    ) -> Result<R, Error> {
+    ) -> Result<Option<R>, Error> {
         let key_bytes = key.to_generic().to_bytes();
         let value = self.data.get(key_bytes)?;
         match value {
@@ -741,9 +741,9 @@ where
                 }
 
                 let archived_data = check_archived_root::<Evolving<V>>(&archived_record.data)?;
-                Ok(f(Some(archived_data.0.get())))
+                Ok(Some(f(archived_data.0.get())))
             }
-            None => Ok(f(None)),
+            None => Ok(None),
         }
     }
 
@@ -907,5 +907,47 @@ where
                 None
             }
         })
+    }
+
+    pub fn iter_archived_with<F: FnMut(K, &V::Archived)>(
+        &self,
+        mut f: F,
+    ) {
+        for key in self.data.iter().keys() {
+            let Ok(key) = key else {
+                continue
+            };
+            if key == KEY_POOL {
+                continue
+            }
+            let Some(key) = GenericKey::from_bytes(&key) else {
+                continue
+            };
+            let key = K::from_generic(key);
+            let key_bytes = key.to_generic().to_bytes();
+            let Ok(Some(bytes)) = self.data.get(key_bytes) else {
+                continue
+            };
+            let Ok(archived_record) = check_archived_root::<Record>(&bytes) else {
+                continue
+            };
+
+            let record_evolution: SimpleVersion = archived_record
+                .data_evolution
+                .deserialize(&mut rkyv::Infallible)
+                .expect("");
+            if record_evolution != V::evolution() {
+                warn!(
+                    "record evolution is {record_evolution} and code is {}",
+                    V::evolution()
+                );
+                continue
+            }
+
+            let Ok(archived_data) = check_archived_root::<Evolving<V>>(&archived_record.data) else {
+                continue
+            };
+            f(key, archived_data.0.get());
+        }
     }
 }

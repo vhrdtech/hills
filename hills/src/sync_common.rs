@@ -248,7 +248,7 @@ macro_rules! handle_result {
         }
     }};
 }
-pub use handle_result;
+// pub use handle_result;
 
 pub(crate) fn handle_incoming_record(
     db: &mut Db,
