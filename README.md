@@ -1,3 +1,7 @@
+<b>WARNING: Project is not maintained anymore.
+
+Main show stopper was lack of an easy way to achieve backwards and forwards compatibility of binary data.</b>
+
 <p align="center">
     Embeddable, distributed, typed kv database.
 </p>
@@ -65,7 +69,3 @@ Additionally gaining several properties, such as:
 * Zero-copy access thanks to [rkyv](https://github.com/rkyv/rkyv) and [sled](https://github.com/spacejam/sled). (Not measured, but potentially orders of magnitude faster than doing SQL queries).
 * Ability to view all the data offline, without loosing any functions of an application.
 * Create new records offline, that will be automatically synchronised later.
-
-In particular, it is used for an internal product lifetime and manufacturing management system at vhrd.tech.
-Keeping track of products, equipment, bill of materials, parts stock and ordering, serials and barcodes in use and others.
-System is accessed from user workstations to view and edit data, as well as from various machinery (e.g. pick and place machine, when assembling boards and fetching parts from a warehouse stock).
